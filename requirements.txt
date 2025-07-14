@@ -1,0 +1,11 @@
+torch
+torchvision 
+retinaface-pytorch
+numpy
+opencv-python
+PyQt5
+requests>=2.31.0
+watchdog>=3.0.0
+facenet-pytorch>=2.5.2
+onnxruntime>=1.16.0
+python-dotenv

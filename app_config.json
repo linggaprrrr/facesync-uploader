@@ -1,0 +1,8 @@
+{
+  "admin_password_hash": "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92",
+  "allowed_paths": [
+    "/Users/linggapangestu/Documents/01_dufan"
+  ],
+  "require_admin": false,
+  "is_configured": true
+}
