@@ -9,3 +9,5 @@ watchdog>=3.0.0
 facenet-pytorch>=2.5.2
 onnxruntime>=1.16.0
 python-dotenv
+retina-face==0.0.17
+tf-keras>=2.14.0

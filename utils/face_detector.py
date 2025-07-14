@@ -1,35 +1,19 @@
 import logging
-from facenet_pytorch import InceptionResnetV1
 import cv2
+import os
 import numpy as np
 import torch
-from PyQt5.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject
+from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
 import requests
 import json
-import onnxruntime as ort
 from retinaface import RetinaFace
 import logging
-from functools import lru_cache
 import time
-from concurrent.futures import ThreadPoolExecutor
-
-
-# Global variables
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)  # Move to GPU
-logger = logging.getLogger(__name__)
-
-# Print GPU info saat startup
-if torch.cuda.is_available():
-    gpu_name = torch.cuda.get_device_name(0)
-    logger.info(f"🚀 GPU detected: {gpu_name}")
-    logger.info(f"💾 GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
-else:
-    logger.info("💻 Using CPU processing")
+from core.device_setup import device, resnet
 
 # Shared detector instance untuk reuse
 _detector_instance = None
-
+logger = logging.getLogger(__name__)
 
 class OptimizedRetinaFaceDetector:
     """Optimized RetinaFace detector dengan speed improvements"""
@@ -146,6 +130,7 @@ class OptimizedRetinaFaceDetector:
         except Exception as e:
             logger.error(f"❌ Error dalam deteksi: {e}")
             return False, None
+
         
 
 

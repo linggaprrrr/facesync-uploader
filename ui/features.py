@@ -1,25 +1,13 @@
 
-import sys
 import os
 import shutil
-import json
-import hashlib
-from datetime import datetime
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileSystemModel, QTreeView, QListView,
-    QFileDialog, QTextEdit, QPushButton, QVBoxLayout, QWidget, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QAction,
-    QInputDialog, QMessageBox, QAbstractItemView, QDialog, QFormLayout,
-    QDialogButtonBox, QTabWidget, QGroupBox, QCheckBox
+    QListWidget, QMenu, QAction,
+    QInputDialog, QMessageBox, QAbstractItemView
 )
-from PyQt5.QtGui import QPixmap, QIcon, QDrag, QClipboard
-from PyQt5.QtCore import Qt, QDir, QMimeData, QUrl, QThread, pyqtSignal
-from watcher import start_watcher, stop_watcher
+from PyQt5.QtGui import QDrag
+from PyQt5.QtCore import Qt, QMimeData, QUrl
 
-from admin_setup_dialogs import AdminSetupDialog
-from admin_login import AdminLoginDialog
-from admin_setting import AdminSettingsDialog
-from config_manager import ConfigManager
 
 
 

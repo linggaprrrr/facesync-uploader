@@ -1,2 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.log
+
+# Virtual environments (jika pakai)
+venv/
+env/
+.venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Konfigurasi lokal & environment
 .env
-/dist
+*.env
+app_config.json
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db

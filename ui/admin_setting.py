@@ -1,27 +1,10 @@
-import sys
-import os
-import shutil
-import json
-import hashlib
-from datetime import datetime
+
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileSystemModel, QTreeView, QListView,
     QFileDialog, QTextEdit, QPushButton, QVBoxLayout, QWidget, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QAction,
     QInputDialog, QMessageBox, QAbstractItemView, QDialog, QFormLayout,
     QDialogButtonBox, QTabWidget, QGroupBox, QCheckBox
 )
-from PyQt5.QtGui import QPixmap, QIcon, QDrag, QClipboard
-from PyQt5.QtCore import Qt, QDir, QMimeData, QUrl, QThread, pyqtSignal
-from watcher import start_watcher, stop_watcher
-
-
-
-
-
-
-
-
 
 class AdminSettingsDialog(QDialog):
     """Dialog untuk pengaturan admin"""

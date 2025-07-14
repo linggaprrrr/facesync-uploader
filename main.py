@@ -1,32 +1,22 @@
 import sys
 import os
-import shutil
-import json
-import hashlib
-from datetime import datetime
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileSystemModel, QTreeView, QListView,
-    QFileDialog, QTextEdit, QPushButton, QVBoxLayout, QWidget, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QAction,
-    QInputDialog, QMessageBox, QAbstractItemView, QDialog, QFormLayout,
-    QDialogButtonBox, QTabWidget, QGroupBox, QCheckBox
+    QApplication, QMessageBox, QDialog
 )
-from PyQt5.QtGui import QPixmap, QIcon, QDrag, QClipboard
-from PyQt5.QtCore import Qt, QDir, QMimeData, QUrl, QThread, pyqtSignal
-from watcher import start_watcher, stop_watcher
-
-from admin_setup_dialogs import AdminSetupDialog
-from admin_login import AdminLoginDialog
-from admin_setting import AdminSettingsDialog
-from config_manager import ConfigManager
-from explorer_window import ExplorerWindow
-from features import DragDropListWidget
+from ui.admin_setup_dialogs import AdminSetupDialog
+from ui.admin_login import AdminLoginDialog
+from ui.config_manager import ConfigManager
+from ui.explorer_window import ExplorerWindow
 
 class MainApplication:
     """Main application controller"""
     
     def __init__(self):
         self.app = QApplication(sys.argv)
+         # Set logo aplikasi
+        logo_path = os.path.join(os.path.dirname(__file__), "assets", "ownize_logo_2.png")
+        self.app.setWindowIcon(QIcon(logo_path))
         self.config_manager = ConfigManager()
         self.main_window = None
     
