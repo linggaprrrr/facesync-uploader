@@ -9,7 +9,7 @@ import json
 from retinaface import RetinaFace
 import logging
 import time
-from core.device_setup import device, resnet
+from core.device_setup import device, resnet, API_BASE
 
 # Shared detector instance untuk reuse
 _detector_instance = None
@@ -291,13 +291,13 @@ def parse_codes_from_relative_path(relative_path, allowed_path):
     """Parse unit, outlet, photo_type codes from path"""
     try:
         parts = relative_path.split(os.sep)
-        if len(parts) < 3:
+        if len(parts) < 4:
             logger.warning(f"Path tidak lengkap: {relative_path}")
             return None, None, None
 
-        unit_folder = os.path.basename(allowed_path.rstrip(os.sep))
-        outlet_folder = parts[0]
-        photo_type_folder = parts[1]
+        unit_folder = parts[0]
+        outlet_folder = parts[1]
+        photo_type_folder = parts[2]
 
         unit_code = unit_folder.split("_")[0]
         outlet_code = outlet_folder.split("_")[0]
@@ -329,26 +329,28 @@ def upload_embedding_to_backend(file_path, faces, allowed_paths):
             logger.error("File path tidak termasuk folder yang diizinkan.")
             return False
 
-        unit_code, outlet_code, photo_type_code = parse_codes_from_relative_path(
+        unit_code, photo_type_code, outlet_code = parse_codes_from_relative_path(
             relative_path, allowed_paths[0]
         )
+
+        
         if not all([unit_code, outlet_code, photo_type_code]):
             logger.error("Gagal parsing folder path.")
             return False
 
         # Ensure faces are JSON serializable
         serializable_faces = convert_to_json_serializable(faces)
-
+        
         data = {
             "unit_code": unit_code,
-            "outlet_code": outlet_code,
             "photo_type_code": photo_type_code,
+            "outlet_code": outlet_code,            
             "faces": safe_json_dumps(serializable_faces),
         }
 
         with open(file_path, "rb") as f:
             files = {"file": f}
-            url = "http://localhost:8001/faces/upload-embedding"
+            url = f"{API_BASE}/faces/upload-embedding"
             
             # Add timeout untuk prevent hanging
             response = requests.post(url, data=data, files=files, timeout=30)
