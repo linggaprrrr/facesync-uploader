@@ -18,9 +18,12 @@ logger = logging.getLogger(__name__)
 class OptimizedRetinaFaceDetector:
     """Optimized RetinaFace detector dengan speed improvements"""
     
-    def __init__(self, conf_threshold=0.6, nms_threshold=0.4, max_size=640):
-        # Auto-detect device
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    def __init__(self, conf_threshold=0.6, nms_threshold=0.4, max_size=640, device=None):
+        # Auto-detect device or use specified device
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.max_size = max_size
