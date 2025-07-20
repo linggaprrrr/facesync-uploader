@@ -11,3 +11,9 @@ API_BASE = os.getenv("BASE_URL")
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+# Check device
+if torch.cuda.is_available():
+    print(f"✅ Using CUDA - GPU: {torch.cuda.get_device_name()}")
+else:
+    print("⚠️ Using CPU")
