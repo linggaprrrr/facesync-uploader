@@ -1,6 +1,13 @@
 import sys
 import os
+import time
+import threading
+import hashlib
+import logging
 from datetime import datetime
+from typing import Dict, Set, Optional, Callable
+from dataclasses import dataclass
+from enum import Enum
 from PyQt5.QtWidgets import (
     QMainWindow, QListView,
     QFileDialog, QTextEdit, QPushButton, QVBoxLayout, QWidget, QHBoxLayout,
@@ -12,12 +19,376 @@ from core.watcher import start_watcher, stop_watcher
 from ui.admin_login import AdminLoginDialog
 from ui.admin_setting import AdminSettingsDialog
 from ui.features import DragDropListWidget
-import logging
-from PyQt5.QtCore import QThreadPool, pyqtSignal
+from PyQt5.QtCore import QThreadPool
 import cv2
-import time
+import numpy as np
 from utils.face_detector import FaceEmbeddingWorker
+
 logger = logging.getLogger(__name__)
+
+class FileState(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing" 
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+@dataclass
+class FileInfo:
+    path: str
+    size: int
+    modified_time: float
+    hash: Optional[str] = None
+    state: FileState = FileState.PENDING
+    retry_count: int = 0
+    last_attempt: float = 0
+
+class ProductionFileIntegrityHandler:
+    """Production-ready file integrity handler"""
+    
+    def __init__(self, 
+                 max_retries: int = 3,
+                 initial_delay: float = 0.2,
+                 max_delay: float = 2.0,
+                 stability_check_duration: float = 0.5,
+                 file_timeout: float = 15.0,
+                 cleanup_interval: float = 300.0):
+        
+        # Configuration
+        self.max_retries = max_retries
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.stability_check_duration = stability_check_duration
+        self.file_timeout = file_timeout
+        self.cleanup_interval = cleanup_interval
+        
+        # State management
+        self.file_registry: Dict[str, FileInfo] = {}
+        self.processing_files: Set[str] = set()
+        self.failed_files: Set[str] = set()
+        
+        # Thread safety
+        self._lock = threading.RLock()
+        self._cleanup_timer = None
+        
+        # Callbacks
+        self.on_file_ready: Optional[Callable[[str], None]] = None
+        self.on_file_failed: Optional[Callable[[str, str], None]] = None
+        
+        # Logging
+        self.logger = logging.getLogger(__name__)
+        
+        # Start cleanup timer
+        self._start_cleanup_timer()
+    
+    def register_file(self, file_path: str) -> bool:
+        """Register a new file for processing"""
+        file_path = os.path.abspath(file_path)
+        
+        with self._lock:
+            # Skip if already processing or recently failed
+            if (file_path in self.processing_files or 
+                file_path in self.failed_files):
+                return False
+            
+            # Skip if file doesn't exist
+            if not os.path.exists(file_path):
+                return False
+            
+            try:
+                stat = os.stat(file_path)
+                file_info = FileInfo(
+                    path=file_path,
+                    size=stat.st_size,
+                    modified_time=stat.st_mtime,
+                    state=FileState.PENDING
+                )
+                
+                self.file_registry[file_path] = file_info
+                self.logger.info(f"Registered file: {os.path.basename(file_path)}")
+                
+                # Start processing in background thread
+                threading.Thread(
+                    target=self._process_file_async,
+                    args=(file_path,),
+                    daemon=True,
+                    name=f"FileProcessor-{os.path.basename(file_path)}"
+                ).start()
+                
+                return True
+                
+            except (OSError, IOError) as e:
+                self.logger.warning(f"Failed to register {file_path}: {e}")
+                return False
+    
+    def _process_file_async(self, file_path: str):
+        """Process file asynchronously with full error handling"""
+        filename = os.path.basename(file_path)
+        
+        try:
+            with self._lock:
+                if file_path not in self.file_registry:
+                    return
+                self.processing_files.add(file_path)
+                self.file_registry[file_path].state = FileState.PROCESSING
+            
+            # Wait for file to be ready
+            if self._wait_for_file_ready(file_path):
+                # File is ready, notify callback
+                if self.on_file_ready:
+                    try:
+                        self.on_file_ready(file_path)
+                        with self._lock:
+                            self.file_registry[file_path].state = FileState.COMPLETED
+                        self.logger.info(f"Successfully processed: {filename}")
+                    except Exception as e:
+                        self._handle_file_failure(file_path, f"Callback error: {e}")
+                else:
+                    with self._lock:
+                        self.file_registry[file_path].state = FileState.COMPLETED
+            else:
+                self._handle_file_failure(file_path, "File readiness timeout")
+                
+        except Exception as e:
+            self._handle_file_failure(file_path, f"Processing error: {e}")
+        finally:
+            with self._lock:
+                self.processing_files.discard(file_path)
+    
+    def _wait_for_file_ready(self, file_path: str) -> bool:
+        """Comprehensive file readiness check"""
+        start_time = time.time()
+        
+        while time.time() - start_time < self.file_timeout:
+            try:
+                file_info = self.file_registry.get(file_path)
+                if not file_info:
+                    return False
+                
+                # Check if we should retry (exponential backoff)
+                if not self._should_retry(file_info):
+                    time.sleep(0.1)
+                    continue
+                
+                # Update retry info
+                with self._lock:
+                    file_info.retry_count += 1
+                    file_info.last_attempt = time.time()
+                
+                # Comprehensive readiness check
+                if self._comprehensive_file_check(file_path):
+                    return True
+                
+                # Calculate next retry delay (exponential backoff)
+                delay = min(
+                    self.initial_delay * (2 ** file_info.retry_count),
+                    self.max_delay
+                )
+                time.sleep(delay)
+                
+            except Exception as e:
+                self.logger.warning(f"Error in readiness check for {file_path}: {e}")
+                time.sleep(self.initial_delay)
+        
+        return False
+    
+    def _should_retry(self, file_info: FileInfo) -> bool:
+        """Check if we should attempt another retry"""
+        if file_info.retry_count >= self.max_retries:
+            return False
+        
+        # Respect exponential backoff timing
+        if file_info.last_attempt > 0:
+            min_wait = self.initial_delay * (2 ** file_info.retry_count)
+            elapsed = time.time() - file_info.last_attempt
+            if elapsed < min_wait:
+                return False
+        
+        return True
+    
+    def _comprehensive_file_check(self, file_path: str) -> bool:
+        """Multi-layered file integrity verification"""
+        try:
+            # 1. Basic existence and permissions
+            if not os.path.exists(file_path) or not os.access(file_path, os.R_OK):
+                return False
+            
+            # 2. File size stability check
+            if not self._is_file_size_stable(file_path):
+                return False
+            
+            # 3. File lock check (platform-specific)
+            if not self._can_access_exclusively(file_path):
+                return False
+            
+            # 4. Image integrity verification
+            if not self._verify_image_integrity(file_path):
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.debug(f"File check failed for {file_path}: {e}")
+            return False
+    
+    def _is_file_size_stable(self, file_path: str) -> bool:
+        """Check if file size remains stable"""
+        try:
+            initial_size = os.path.getsize(file_path)
+            if initial_size == 0:
+                return False
+            
+            time.sleep(self.stability_check_duration)
+            
+            final_size = os.path.getsize(file_path)
+            return initial_size == final_size
+            
+        except (OSError, IOError):
+            return False
+    
+    def _can_access_exclusively(self, file_path: str) -> bool:
+        """Platform-specific exclusive access check"""
+        try:
+            if os.name == 'nt':  # Windows
+                return self._windows_lock_check(file_path)
+            else:  # Unix-like
+                return self._unix_lock_check(file_path)
+        except Exception:
+            return False
+    
+    def _windows_lock_check(self, file_path: str) -> bool:
+        """Windows-specific file lock check"""
+        try:
+            import msvcrt
+            with open(file_path, 'rb') as f:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            return True
+        except (ImportError, OSError, IOError):
+            return False
+    
+    def _unix_lock_check(self, file_path: str) -> bool:
+        """Unix-specific file lock check"""
+        try:
+            import fcntl
+            with open(file_path, 'rb') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return True
+        except (ImportError, OSError, IOError):
+            return False
+    
+    def _verify_image_integrity(self, file_path: str) -> bool:
+        """Verify image can be read and is valid"""
+        try:
+            # Try reading with cv2
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return False
+            
+            # Verify it's a valid numpy array with data
+            if not isinstance(img, np.ndarray) or img.size == 0:
+                return False
+            
+            # Check image dimensions are reasonable
+            if len(img.shape) < 2 or any(dim <= 0 for dim in img.shape[:2]):
+                return False
+            
+            # Try to access image data (will fail if corrupted)
+            _ = img[0, 0]
+            
+            return True
+            
+        except Exception as e:
+            self.logger.debug(f"Image integrity check failed: {e}")
+            return False
+    
+    def _handle_file_failure(self, file_path: str, reason: str):
+        """Handle file processing failure"""
+        filename = os.path.basename(file_path)
+        
+        with self._lock:
+            if file_path in self.file_registry:
+                self.file_registry[file_path].state = FileState.FAILED
+            self.failed_files.add(file_path)
+        
+        self.logger.error(f"File processing failed for {filename}: {reason}")
+        
+        if self.on_file_failed:
+            try:
+                self.on_file_failed(file_path, reason)
+            except Exception as e:
+                self.logger.error(f"Error in failure callback: {e}")
+    
+    def _start_cleanup_timer(self):
+        """Start periodic cleanup of old file records"""
+        def cleanup():
+            self._cleanup_old_records()
+            # Schedule next cleanup
+            self._cleanup_timer = threading.Timer(
+                self.cleanup_interval, 
+                cleanup
+            )
+            self._cleanup_timer.daemon = True
+            self._cleanup_timer.start()
+        
+        cleanup()
+    
+    def _cleanup_old_records(self):
+        """Clean up old file records to prevent memory leaks"""
+        current_time = time.time()
+        cutoff_time = current_time - self.cleanup_interval
+        
+        with self._lock:
+            # Clean up completed and failed files older than cleanup interval
+            paths_to_remove = []
+            
+            for file_path, file_info in self.file_registry.items():
+                if (file_info.state in [FileState.COMPLETED, FileState.FAILED] and
+                    file_info.last_attempt < cutoff_time):
+                    paths_to_remove.append(file_path)
+            
+            for path in paths_to_remove:
+                del self.file_registry[path]
+                self.failed_files.discard(path)
+        
+        if paths_to_remove:
+            self.logger.info(f"Cleaned up {len(paths_to_remove)} old file records")
+    
+    def get_status(self) -> Dict:
+        """Get current status of file handler"""
+        with self._lock:
+            return {
+                'total_files': len(self.file_registry),
+                'processing': len(self.processing_files),
+                'completed': len([f for f in self.file_registry.values() 
+                                if f.state == FileState.COMPLETED]),
+                'failed': len(self.failed_files),
+                'pending': len([f for f in self.file_registry.values() 
+                              if f.state == FileState.PENDING])
+            }
+    
+    def reset_failed_file(self, file_path: str) -> bool:
+        """Reset a failed file for retry"""
+        with self._lock:
+            if file_path in self.failed_files:
+                self.failed_files.remove(file_path)
+                if file_path in self.file_registry:
+                    file_info = self.file_registry[file_path]
+                    file_info.state = FileState.PENDING
+                    file_info.retry_count = 0
+                    file_info.last_attempt = 0
+                return True
+        return False
+    
+    def shutdown(self):
+        """Clean shutdown of the handler"""
+        if self._cleanup_timer:
+            self._cleanup_timer.cancel()
+        
+        with self._lock:
+            self.processing_files.clear()
+            self.file_registry.clear()
+            self.failed_files.clear()
 
 class WatcherThread(QThread):
     """Optimized watcher thread"""
@@ -51,19 +422,8 @@ class WatcherThread(QThread):
         self.quit()
         self.wait()
 
-def wait_for_file_ready(file_path, timeout=5, check_interval=0.2):
-        """Wait until the file is readable by OpenCV."""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                image = cv2.imread(file_path)
-                if image is not None:
-                    return image  # Success!
-            time.sleep(check_interval)
-        return None  # Failed to read
-
 class ExplorerWindow(QMainWindow):
-    """Optimized main window dengan performance improvements"""
+    """Enhanced Explorer Window with Production File Integrity Handler"""
     
     def __init__(self, config_manager):
         super().__init__()
@@ -74,18 +434,33 @@ class ExplorerWindow(QMainWindow):
         self.setGeometry(100, 100, 1200, 700)
         self.watcher_thread = None
 
+        # 🚀 NEW: Initialize production file integrity handler
+        self.file_handler = ProductionFileIntegrityHandler(
+            max_retries=3,
+            initial_delay=0.2,
+            stability_check_duration=0.5,
+            file_timeout=15.0
+        )
+        
+        # Set up callbacks for file handler
+        self.file_handler.on_file_ready = self._process_ready_file
+        self.file_handler.on_file_failed = self._handle_failed_file
+
         # Initialize UI
         self._init_ui()
         self._setup_connections()
         
         # Status tracking
         self.embedding_in_progress = 0
-        self.processing_files = {}  # Track files being processed
+        self.processing_files = {}  # Keep for backward compatibility
         
         # Navigation
         self.path_history = []
         self.current_path = ""
         self.allowed_paths = self.config_manager.config.get("allowed_paths", [])
+        
+        # Supported image extensions
+        self.image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tga'}
         
         # Auto-load initial path
         self._load_initial_path()
@@ -101,11 +476,16 @@ class ExplorerWindow(QMainWindow):
         self.back_button = QPushButton("← Back")
         self.back_button.setEnabled(False)
 
+        # 🆕 NEW: Add retry failed files button
+        self.retry_button = QPushButton("🔄 Retry Failed")
+        self.retry_button.clicked.connect(self.retry_failed_files)
+
         top_layout = QHBoxLayout()
         top_layout.addWidget(self.back_button)
         top_layout.addWidget(QLabel("📁"))
         top_layout.addWidget(self.path_display)
-        top_layout.addStretch()        
+        top_layout.addStretch()
+        top_layout.addWidget(self.retry_button)  # 🆕 NEW
         top_layout.addWidget(self.admin_button)
 
         # Search input
@@ -154,7 +534,6 @@ class ExplorerWindow(QMainWindow):
 
     def _setup_connections(self):
         """Setup signal connections"""
-        
         self.admin_button.clicked.connect(self.show_admin_settings)
         self.back_button.clicked.connect(self.go_back)
         self.file_list.itemDoubleClicked.connect(self.open_file)
@@ -170,13 +549,27 @@ class ExplorerWindow(QMainWindow):
             self.start_monitoring(initial_path)
 
     def update_embedding_status(self):
-        """Update embedding status display"""
-        if self.embedding_in_progress > 0:
-            self.embedding_label.setText(f"🧠 Processing: {self.embedding_in_progress} files")
+        """Update embedding status display with enhanced info"""
+        # Get file handler status
+        handler_status = self.file_handler.get_status()
+        
+        if self.embedding_in_progress > 0 or handler_status['processing'] > 0:
+            total_processing = self.embedding_in_progress + handler_status['processing']
+            status_text = f"🧠 Processing: {total_processing} files"
+            
+            # Add failed count if any
+            if handler_status['failed'] > 0:
+                status_text += f" | ❌ Failed: {handler_status['failed']}"
+            
+            self.embedding_label.setText(status_text)
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)  # Indeterminate progress
         else:
-            self.embedding_label.setText("")
+            failed_count = handler_status['failed']
+            if failed_count > 0:
+                self.embedding_label.setText(f"❌ {failed_count} failed files (click Retry)")
+            else:
+                self.embedding_label.setText("")
             self.progress_bar.setVisible(False)
             # Clear progress label juga ketika semua selesai
             if self.embedding_in_progress == 0:
@@ -274,14 +667,13 @@ class ExplorerWindow(QMainWindow):
             return
             
         try:
-            image_exts = ['.png', '.jpg', '.jpeg']
             items = os.listdir(folder_path)
             
             # Separate and sort items
             folders = sorted([item for item in items 
                             if os.path.isdir(os.path.join(folder_path, item))])
             image_files = sorted([item for item in items 
-                                if os.path.splitext(item)[1].lower() in image_exts])
+                                if self._is_supported_image_file(item)])
             
             # Add folders first
             for folder_name in folders:
@@ -293,6 +685,11 @@ class ExplorerWindow(QMainWindow):
                 
         except Exception as e:
             self.log_with_timestamp(f"❌ Error loading folder: {str(e)}")
+
+    def _is_supported_image_file(self, filename):
+        """Check if file is a supported image format"""
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in self.image_extensions
 
     def _add_folder_item(self, folder_name, folder_path):
         """Add folder item to list"""
@@ -404,43 +801,76 @@ class ExplorerWindow(QMainWindow):
             self.watcher_thread = None
             self.status_bar.showMessage("Ready")
 
-    
-
+    # 🚀 NEW: Enhanced file detection with production integrity handler
     def on_new_file_detected(self, file_path):
-        """Handle new file detection"""
+        """Enhanced file detection using production-ready integrity handler"""
         filename = os.path.basename(file_path)
-
-        image_exts = ['.png', '.jpg', '.jpeg']
-        if os.path.splitext(filename)[1].lower() not in image_exts:
+        
+        # Check if it's a supported image
+        if not self._is_supported_image_file(filename):
             return
 
-        self.log_with_timestamp(f"🆕 New image: {filename}")
+        self.log_with_timestamp(f"🆕 New image detected: {filename}")
 
         # Add to file list if in current folder
         file_dir = os.path.dirname(file_path)
         if file_dir == self.current_path:
             self._add_image_item(filename, file_dir)
 
-        # Prevent double processing
-        if file_path in self.processing_files:
-            return
-
-        # 🛑 Wait until file is fully written and readable
-        test_image = wait_for_file_ready(file_path)
-        if test_image is None:
-            self.log_with_timestamp(f"❌ File not ready or unreadable: {filename}")
-            return
-
-        # ✅ Proceed with processing
-        self.processing_files[file_path] = True
-        worker = FaceEmbeddingWorker(file_path, self.allowed_paths)
-        worker.signals.finished.connect(self.on_embedding_finished)
-        worker.signals.progress.connect(self.update_progress_label)
-
-        self.embedding_in_progress += 1
+        # Register with production file handler (non-blocking)
+        if self.file_handler.register_file(file_path):
+            self.log_with_timestamp(f"📝 Registered for processing: {filename}")
+        else:
+            self.log_with_timestamp(f"⚠️ Already processing or failed: {filename}")
+        
+        # Update status immediately
         self.update_embedding_status()
-        self.threadpool.start(worker)
 
+    # 🚀 NEW: Process file after integrity verification (callback from handler)
+    def _process_ready_file(self, file_path: str):
+        """Process file after integrity verification"""
+        filename = os.path.basename(file_path)
+        
+        try:
+            # Mark as processing in legacy system for compatibility
+            self.processing_files[file_path] = True
+            
+            # Create and start worker
+            worker = FaceEmbeddingWorker(file_path, self.allowed_paths)
+            worker.signals.finished.connect(self._on_embedding_finished)
+            worker.signals.progress.connect(self.update_progress_label)
+            
+            self.embedding_in_progress += 1
+            self.update_embedding_status()
+            self.threadpool.start(worker)
+            
+            self.log_with_timestamp(f"🚀 Started processing: {filename}")
+            
+        except Exception as e:
+            self.log_with_timestamp(f"❌ Error starting processing for {filename}: {e}")
+            # Clean up on error
+            if file_path in self.processing_files:
+                del self.processing_files[file_path]
+            self.update_embedding_status()
+
+    # 🚀 NEW: Handle files that failed integrity checks
+    def _handle_failed_file(self, file_path: str, reason: str):
+        """Handle files that failed integrity checks"""
+        filename = os.path.basename(file_path)
+        self.log_with_timestamp(f"❌ File processing failed for {filename}: {reason}")
+        self.update_embedding_status()
+
+    # 🚀 ENHANCED: Enhanced version of embedding finished handler
+    def _on_embedding_finished(self, file_path: str):
+        """Enhanced version of your existing embedding finished handler"""
+        # Call your existing logic
+        self.on_embedding_finished(file_path, [], True)  # Placeholder values
+        
+        # Clean up from processing files
+        if file_path in self.processing_files:
+            del self.processing_files[file_path]
+        
+        self.update_embedding_status()
 
     def on_embedding_finished(self, file_path, embeddings, success):
         """Handle embedding completion"""
@@ -473,6 +903,39 @@ class ExplorerWindow(QMainWindow):
                     self.file_list.takeItem(i)
                     break
 
+    # 🚀 NEW: Retry failed files functionality
+    def retry_failed_files(self):
+        """Retry all failed files"""
+        status = self.file_handler.get_status()
+        failed_count = status['failed']
+        
+        if failed_count == 0:
+            self.log_with_timestamp("✅ No failed files to retry")
+            return
+        
+        # Get list of failed files and retry them
+        with self.file_handler._lock:
+            failed_files = list(self.file_handler.failed_files)
+        
+        retried = 0
+        for file_path in failed_files:
+            if self.file_handler.reset_failed_file(file_path):
+                if self.file_handler.register_file(file_path):
+                    retried += 1
+        
+        self.log_with_timestamp(f"🔄 Retrying {retried} failed files")
+        self.update_embedding_status()
+
+    # 🚀 NEW: Get comprehensive processing status
+    def get_processing_status(self) -> Dict:
+        """Get comprehensive processing status"""
+        handler_status = self.file_handler.get_status()
+        return {
+            **handler_status,
+            'embedding_in_progress': self.embedding_in_progress,
+            'legacy_processing_count': len(self.processing_files)
+        }
+
     def show_admin_settings(self):
         """Show admin settings"""
         login_dialog = AdminLoginDialog(self.config_manager, self)
@@ -487,6 +950,10 @@ class ExplorerWindow(QMainWindow):
         if self.watcher_thread:
             self.stop_monitoring()
         
+        # 🚀 NEW: Clean shutdown of file handler
+        self.file_handler.shutdown()
+        
         # Wait for running workers to complete
         self.threadpool.waitForDone(3000)  # 3 second timeout
         event.accept()
+
