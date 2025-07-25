@@ -14,7 +14,8 @@ from ui.admin_setting import AdminSettingsDialog
 from ui.features import DragDropListWidget
 import logging
 from PyQt5.QtCore import QThreadPool, pyqtSignal
-import logging
+import cv2
+import time
 from utils.face_detector import FaceEmbeddingWorker
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,17 @@ class WatcherThread(QThread):
             stop_watcher(self.observer)
         self.quit()
         self.wait()
+
+def wait_for_file_ready(file_path, timeout=5, check_interval=0.2):
+        """Wait until the file is readable by OpenCV."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                image = cv2.imread(file_path)
+                if image is not None:
+                    return image  # Success!
+            time.sleep(check_interval)
+        return None  # Failed to read
 
 class ExplorerWindow(QMainWindow):
     """Optimized main window dengan performance improvements"""
@@ -392,31 +404,43 @@ class ExplorerWindow(QMainWindow):
             self.watcher_thread = None
             self.status_bar.showMessage("Ready")
 
+    
+
     def on_new_file_detected(self, file_path):
         """Handle new file detection"""
         filename = os.path.basename(file_path)
-        
+
         image_exts = ['.png', '.jpg', '.jpeg']
         if os.path.splitext(filename)[1].lower() not in image_exts:
             return
-            
+
         self.log_with_timestamp(f"🆕 New image: {filename}")
-        
+
         # Add to file list if in current folder
         file_dir = os.path.dirname(file_path)
         if file_dir == self.current_path:
             self._add_image_item(filename, file_dir)
-        
-        # Process faces
-        if file_path not in self.processing_files:
-            self.processing_files[file_path] = True
-            worker = FaceEmbeddingWorker(file_path, self.allowed_paths)
-            worker.signals.finished.connect(self.on_embedding_finished)
-            worker.signals.progress.connect(self.update_progress_label)
-            
-            self.embedding_in_progress += 1
-            self.update_embedding_status()
-            self.threadpool.start(worker)
+
+        # Prevent double processing
+        if file_path in self.processing_files:
+            return
+
+        # 🛑 Wait until file is fully written and readable
+        test_image = wait_for_file_ready(file_path)
+        if test_image is None:
+            self.log_with_timestamp(f"❌ File not ready or unreadable: {filename}")
+            return
+
+        # ✅ Proceed with processing
+        self.processing_files[file_path] = True
+        worker = FaceEmbeddingWorker(file_path, self.allowed_paths)
+        worker.signals.finished.connect(self.on_embedding_finished)
+        worker.signals.progress.connect(self.update_progress_label)
+
+        self.embedding_in_progress += 1
+        self.update_embedding_status()
+        self.threadpool.start(worker)
+
 
     def on_embedding_finished(self, file_path, embeddings, success):
         """Handle embedding completion"""

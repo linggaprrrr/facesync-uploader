@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
 import requests
+from pathlib import Path
 import json
 from retinaface import RetinaFace
 import logging
