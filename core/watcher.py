@@ -46,12 +46,13 @@ class FolderWatcher(FileSystemEventHandler):
         """Periodic scan untuk mendeteksi file yang tidak terdeteksi oleh watchdog"""
         while self.scanning:
             try:
-                # Scan setiap 3 detik
-                time.sleep(3)
+                # Scan setiap 8 detik (lebih lambat untuk mengurangi overhead)
+                time.sleep(8)
                 self._check_for_new_files()
                 self._check_for_deleted_files()
             except Exception as e:
                 print(f"Error in periodic scan: {e}")
+                time.sleep(8)  # Continue scanning even after error
 
     def _check_for_new_files(self):
         """Check for new files that weren't detected by watchdog"""
@@ -97,36 +98,64 @@ class FolderWatcher(FileSystemEventHandler):
         except Exception as e:
             print(f"Error checking for deleted files: {e}")
 
-    def _is_file_stable(self, file_path, stable_time=2):
+    def _is_file_stable(self, file_path, stable_time=10, max_retries=3):
         """
         Check if file is stable (finished transferring)
         File dianggap stabil jika ukurannya tidak berubah dalam waktu tertentu
         """
-        try:
-            if not os.path.exists(file_path):
-                return False
+        for attempt in range(max_retries):
+            try:
+                if not os.path.exists(file_path):
+                    print(f"File not found on attempt {attempt + 1}: {file_path}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)  # Wait before retry
+                        continue
+                    return False
+                    
+                # Get initial size and mtime
+                initial_size = os.path.getsize(file_path)
+                initial_mtime = os.path.getmtime(file_path)
                 
-            # Get initial size
-            initial_size = os.path.getsize(file_path)
-            initial_mtime = os.path.getmtime(file_path)
-            
-            # Wait for stable_time seconds
-            time.sleep(stable_time)
-            
-            # Check if size and modification time are still the same
-            if not os.path.exists(file_path):
-                return False
+                # Skip empty files immediately
+                if initial_size == 0:
+                    print(f"Empty file detected, waiting: {file_path}")
+                    if attempt < max_retries - 1:
+                        time.sleep(stable_time)
+                        continue
+                    return False
                 
-            current_size = os.path.getsize(file_path)
-            current_mtime = os.path.getmtime(file_path)
-            
-            return (initial_size == current_size and 
-                   initial_mtime == current_mtime and 
-                   initial_size > 0)
-                   
-        except Exception as e:
-            print(f"Error checking file stability for {file_path}: {e}")
-            return False
+                # Wait for stable_time seconds
+                time.sleep(stable_time)
+                
+                # Check if file still exists and size/mtime unchanged
+                if not os.path.exists(file_path):
+                    print(f"File disappeared during stability check: {file_path}")
+                    return False
+                    
+                current_size = os.path.getsize(file_path)
+                current_mtime = os.path.getmtime(file_path)
+                
+                # File is stable if size and mtime unchanged
+                if (initial_size == current_size and 
+                    initial_mtime == current_mtime and 
+                    initial_size > 0):
+                    print(f"File stable after {stable_time}s: {os.path.basename(file_path)} ({initial_size} bytes)")
+                    return True
+                else:
+                    print(f"File still changing on attempt {attempt + 1}: {os.path.basename(file_path)} "
+                          f"({initial_size} -> {current_size} bytes)")
+                    if attempt < max_retries - 1:
+                        # Increase wait time for next attempt
+                        stable_time += 2
+                        continue
+                        
+            except Exception as e:
+                print(f"Error checking file stability for {file_path} (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                    
+        return False
 
     def on_created(self, event):
         """Handle watchdog created event"""
