@@ -152,7 +152,7 @@ class SimpleFileChecker(QThread):
             self.file_failed.emit(self.file_path, f"Checker error: {e}")
 
 class WatcherThread(QThread):
-    """File watcher thread"""
+    """Enhanced File watcher thread with FTP support"""
     new_file_signal = pyqtSignal(str)
     deleted_file_signal = pyqtSignal(str)
 
@@ -161,14 +161,24 @@ class WatcherThread(QThread):
         self.folder_path = folder_path
         self.recursive = recursive
         self.observer = None
+        self.event_handler = None
 
     def run(self):
-        self.observer = start_watcher(
+        # Use the enhanced watcher
+        result = start_watcher(
             self.folder_path,
             self.handle_new_file,
             self.handle_deleted_file,
             recursive=self.recursive
         )
+        
+        # Handle both old and new return format
+        if isinstance(result, tuple):
+            self.observer, self.event_handler = result
+        else:
+            self.observer = result
+            self.event_handler = None
+            
         self.exec_()
 
     def handle_new_file(self, file_path):
@@ -179,7 +189,12 @@ class WatcherThread(QThread):
 
     def stop(self):
         if self.observer:
-            stop_watcher(self.observer)
+            if self.event_handler:
+                # New enhanced format
+                stop_watcher((self.observer, self.event_handler))
+            else:
+                # Old format (backward compatibility)
+                stop_watcher(self.observer)
         self.quit()
         self.wait()
 
@@ -553,7 +568,7 @@ class ExplorerWindow(QMainWindow):
             self.start_monitoring(new_path)
 
     def start_monitoring(self, folder=None):
-        """Start folder monitoring"""
+        """Start folder monitoring with enhanced watcher"""
         if folder is None:
             folder = self.current_path
             
@@ -565,29 +580,38 @@ class ExplorerWindow(QMainWindow):
             self.watcher_thread.folder_path == folder):
             return
         
+        # Stop existing watcher
+        if self.watcher_thread:
+            self.stop_monitoring()
+        
         self.watcher_thread = WatcherThread(folder, recursive=True)
         self.watcher_thread.new_file_signal.connect(self.on_new_file_detected)
         self.watcher_thread.deleted_file_signal.connect(self.on_file_deleted)
         self.watcher_thread.start()
         
-        self.status_bar.showMessage(f"🔄 Monitoring: {os.path.basename(folder)}")
+        self.status_bar.showMessage(f"🔄 Monitoring: {os.path.basename(folder)} (FTP compatible)")
+        self.log_with_timestamp(f"🔄 Started monitoring with FTP support: {os.path.basename(folder)}")
 
     def stop_monitoring(self):
-        """Stop monitoring"""
+        """Stop monitoring with proper cleanup"""
         if self.watcher_thread:
             self.watcher_thread.stop()
             self.watcher_thread = None
             self.status_bar.showMessage("Ready")
+            self.log_with_timestamp("⏹️ Stopped monitoring")
+
 
     def on_new_file_detected(self, file_path):
-        """Queue-based file detection - no overwhelming the system"""
+        """Enhanced file detection handler"""
         filename = os.path.basename(file_path)
         
         # Check if it's a supported image
         if not self._is_supported_image_file(filename):
             return
 
-        self.log_with_timestamp(f"🆕 New image detected: {filename}")
+        # Determine detection method based on logs
+        detection_method = "📡 FTP" if "periodic scan" in str(file_path) else "👁️ Live"
+        self.log_with_timestamp(f"🆕 New image detected ({detection_method}): {filename}")
 
         # Add to file list if in current folder
         file_dir = os.path.dirname(file_path)
