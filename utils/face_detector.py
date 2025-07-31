@@ -5,11 +5,13 @@ import numpy as np
 import torch
 from PyQt5.QtCore import QRunnable, pyqtSignal, QObject
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pathlib import Path
 import json
 from retinaface import RetinaFace
-import logging
 import time
+import socket
 from core.device_setup import device, resnet, API_BASE
 
 # Shared detector instance untuk reuse
@@ -143,8 +145,6 @@ class OptimizedRetinaFaceDetector:
             logger.error(f"❌ Error dalam deteksi: {e}")
             return False, None
 
-        
-
 
 def convert_to_json_serializable(obj):
     """Convert numpy types to Python native types for JSON serialization"""
@@ -185,88 +185,6 @@ def get_shared_detector():
 def create_face_detector():
     """Factory function dengan shared instance"""
     return get_shared_detector()
-
-# def process_faces_in_image(file_path, original_shape=None, pad=None, scale=None):
-#     """Optimized face processing dengan error handling yang lebih baik"""
-#     try:
-#         img = cv2.imread(file_path)
-#         if img is None:
-#             logger.warning(f"❌ Gagal membaca gambar: {file_path}")
-#             return []
-
-#         h, w = img.shape[:2]
-#         logger.info(f"📸 Processing image: {w}x{h}")
-
-#         # Gunakan shared detector
-#         face_detector = get_shared_detector()
-#         success, faces = face_detector.detect(img)
-
-#         if not success or faces is None or len(faces) == 0:
-#             logger.warning("❌ Tidak ada wajah terdeteksi.")
-#             return []
-
-#         logger.info(f"✅ {len(faces)} wajah terdeteksi dengan RetinaFace.")
-
-#         embeddings = []
-#         for i, face in enumerate(faces):
-#             try:
-#                 x, y, w_box, h_box = map(int, face[:4])
-#                 confidence = float(face[4])
-                
-#                 # Validasi koordinat
-#                 x1, y1 = max(x, 0), max(y, 0)
-#                 x2, y2 = min(x + w_box, w), min(y + h_box, h)
-                
-#                 if x2 <= x1 or y2 <= y1:
-#                     logger.warning(f"⚠️ Invalid bbox untuk wajah {i}")
-#                     continue
-                    
-#                 face_crop = img[y1:y2, x1:x2]
-#                 if face_crop.size == 0:
-#                     continue
-
-#                 # Optimized preprocessing
-#                 face_crop_resized = cv2.resize(face_crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-#                 face_rgb = cv2.cvtColor(face_crop_resized, cv2.COLOR_BGR2RGB)
-                
-#                 # Tensor conversion optimization dengan GPU support
-#                 face_tensor = torch.from_numpy(face_rgb).permute(2, 0, 1).float()
-#                 face_tensor = (face_tensor / 255.0 - 0.5) / 0.5
-#                 face_tensor = face_tensor.unsqueeze(0).to(device)  # Move to GPU
-
-#                 with torch.no_grad():
-#                     embedding_tensor = resnet(face_tensor).squeeze()
-#                     embedding = embedding_tensor.cpu().numpy().tolist()  # Move back to CPU for JSON
-
-#                 # Bbox calculation
-#                 if original_shape and pad and scale:
-#                     bbox_dict = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-#                     original_bbox = reverse_letterbox(
-#                         bbox=bbox_dict,
-#                         original_shape=original_shape,
-#                         resized_shape=img.shape[:2],
-#                         pad=pad,
-#                         scale=scale
-#                     )
-#                     original_bbox = convert_to_json_serializable(original_bbox)
-#                 else:
-#                     original_bbox = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-
-#                 embeddings.append({
-#                     "embedding": embedding,
-#                     "bbox": original_bbox,
-#                     "confidence": confidence
-#                 })
-
-#             except Exception as e:
-#                 logger.warning(f"⚠️ Error processing face {i}: {e}")
-#                 continue
-
-#         return embeddings
-        
-#     except Exception as e:
-#         logger.error(f"❌ Error processing image {file_path}: {e}")
-#         return []
 
 def normalize_path(file_path):
     """Normalize file path to handle different path formats"""
@@ -510,24 +428,92 @@ def get_relative_path(file_path, allowed_paths):
         logger.error(f"Error getting relative path: {e}")
         return None
 
-def upload_embedding_to_backend(file_path, faces, allowed_paths):
-    """Upload embedding dengan better error handling"""
+# ===== ENHANCED CONNECTION HANDLING =====
+
+def create_robust_session():
+    """Create session dengan retry strategy untuk upload"""
+    session = requests.Session()
+    
+    # Retry strategy
+    retry_strategy = Retry(
+        total=3,                    # Total retries
+        backoff_factor=2,          # Wait time progression: 1s, 2s, 4s
+        status_forcelist=[429, 500, 502, 503, 504],  # Server errors to retry
+        allowed_methods=["POST"]    # Only retry POST for uploads
+    )
+    
+    # Mount adapter dengan retry
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=20
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # Set headers
+    session.headers.update({
+        'User-Agent': 'FaceSync-Client/1.0',
+        'Accept': 'application/json'
+    })
+    
+    return session
+
+def check_network_connectivity():
+    """Quick network connectivity check"""
+    test_hosts = [
+        ("8.8.8.8", 53),       # Google DNS
+        ("1.1.1.1", 53),       # Cloudflare DNS
+    ]
+    
+    for host, port in test_hosts:
+        try:
+            socket.create_connection((host, port), timeout=5)
+            return True
+        except:
+            continue
+    return False
+
+def check_server_health(api_base, timeout=10):
+    """Check if server is responding"""
     try:
+        # Try to reach server with a simple request
+        test_url = f"{api_base}/health"  # Adjust sesuai endpoint server Anda
+        # Jika tidak ada health endpoint, gunakan endpoint lain yang ringan
+        
+        response = requests.get(test_url, timeout=timeout)
+        return response.status_code < 500
+        
+    except requests.exceptions.ConnectionError:
+        return False
+    except requests.exceptions.Timeout:
+        return False
+    except Exception:
+        # If no health endpoint, assume server is reachable if we get any response
+        return True
+
+def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
+    """Upload embedding dengan enhanced error handling dan retry mechanism"""
+    
+    filename = os.path.basename(file_path)
+    
+    try:
+        # Step 1: Basic validations
         relative_path = get_relative_path(file_path, allowed_paths)
         if not relative_path:
-            logger.error("File path tidak termasuk folder yang diizinkan.")
+            logger.error(f"❌ File path tidak termasuk folder yang diizinkan: {filename}")
             return False
 
         unit_code, photo_type_code, outlet_code = parse_codes_from_relative_path(
             relative_path, allowed_paths[0]
         )
 
-        
         if not all([unit_code, outlet_code, photo_type_code]):
-            logger.error("Gagal parsing folder path.")
+            logger.error(f"❌ Gagal parsing folder path: {filename}")
             return False
 
-        # Ensure faces are JSON serializable
+        # Step 2: Prepare data
         serializable_faces = convert_to_json_serializable(faces)
         
         data = {
@@ -537,29 +523,131 @@ def upload_embedding_to_backend(file_path, faces, allowed_paths):
             "faces": safe_json_dumps(serializable_faces),
         }
 
-        with open(file_path, "rb") as f:
-            files = {"file": f}
-            url = f"{API_BASE}/faces/upload-embedding"
-            
-            # Add timeout untuk prevent hanging
-            response = requests.post(url, data=data, files=files, timeout=30)
-
-        if response.status_code == 200:
-            logger.info("✅ Upload berhasil.")
-            return True
-        else:
-            logger.error(f"❌ Upload gagal: {response.status_code} - {response.text}")
+        # Step 3: Network connectivity check
+        logger.info(f"🔍 Checking connectivity for {filename}...")
+        if not check_network_connectivity():
+            logger.error(f"❌ No network connectivity for {filename}")
             return False
 
-    except requests.exceptions.Timeout:
-        logger.error("❌ Upload timeout - server tidak merespons")
+        # Step 4: Create robust session
+        session = create_robust_session()
+        url = f"{API_BASE}/faces/upload-embedding"
+
+        # Step 5: Upload with retry mechanism
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries} for {filename}")
+                
+                # Check server health before upload (except first attempt)
+                if attempt > 0:
+                    logger.info(f"🏥 Checking server health before retry...")
+                    if not check_server_health(API_BASE):
+                        logger.warning(f"⚠️ Server health check failed on attempt {attempt + 1}")
+                        if attempt < max_retries - 1:
+                            wait_time = (2 ** attempt) * 3  # 3s, 6s, 12s
+                            logger.info(f"⏳ Waiting {wait_time}s before next attempt...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            logger.error(f"❌ Server unreachable after all attempts: {filename}")
+                            return False
+
+                # Attempt upload
+                with open(file_path, "rb") as f:
+                    files = {"file": f}
+                    
+                    # Progressive timeout - increase for each retry
+                    current_timeout = 30 + (attempt * 15)  # 30s, 45s, 60s
+                    
+                    response = session.post(
+                        url, 
+                        data=data, 
+                        files=files, 
+                        timeout=current_timeout
+                    )
+
+                # Handle response
+                if response.status_code == 200:
+                    logger.info(f"✅ Upload berhasil: {filename}")
+                    return True
+                    
+                elif response.status_code in [429, 500, 502, 503, 504]:
+                    # Server errors - retry
+                    logger.warning(f"⚠️ Server error {response.status_code} on attempt {attempt + 1}: {filename}")
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
+                        logger.info(f"⏳ Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ Upload failed after retries - Server error {response.status_code}: {filename}")
+                        return False
+                        
+                else:
+                    # Client errors (4xx) - don't retry
+                    logger.error(f"❌ Upload failed - Client error {response.status_code}: {filename}")
+                    logger.error(f"Response: {response.text}")
+                    return False
+
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"⏰ Timeout on attempt {attempt + 1}: {filename}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 2
+                    logger.info(f"⏳ Retrying in {wait_time}s with longer timeout...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ Upload timeout after all attempts: {filename}")
+                    return False
+                    
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"🔌 Connection error on attempt {attempt + 1}: {filename}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 4  # 4s, 8s, 16s for connection errors
+                    logger.info(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ Connection error - server tidak dapat dijangkau: {filename}")
+                    return False
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"📡 Request error on attempt {attempt + 1}: {filename} - {str(e)}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 2
+                    logger.info(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ Request failed after all attempts: {filename}")
+                    return False
+                    
+            except Exception as e:
+                logger.warning(f"💥 Unexpected error on attempt {attempt + 1}: {filename} - {str(e)}")
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 2
+                    logger.info(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ Upload error after all attempts: {filename} - {str(e)}")
+                    return False
+
+        # Should not reach here
+        logger.error(f"❌ Upload failed: {filename} - Exhausted all retry attempts")
         return False
-    except requests.exceptions.ConnectionError:
-        logger.error("❌ Connection error - server tidak dapat dijangkau")
-        return False
+
     except Exception as e:
-        logger.error(f"❌ Upload error: {str(e)}")
+        logger.error(f"❌ Fatal upload error: {filename} - {str(e)}")
         return False
+    
+    finally:
+        # Cleanup session if created
+        try:
+            if 'session' in locals():
+                session.close()
+        except:
+            pass
 
 class FaceEmbeddingWorkerSignals(QObject):
     finished = pyqtSignal(str, list, bool)  # file_path, embeddings, success
@@ -567,7 +655,7 @@ class FaceEmbeddingWorkerSignals(QObject):
     error = pyqtSignal(str, str) 
     
 class FaceEmbeddingWorker(QRunnable):
-    """Optimized worker dengan progress reporting"""
+    """Optimized worker dengan progress reporting dan robust upload"""
     
     def __init__(self, file_path, allowed_paths):
         super().__init__()
@@ -577,19 +665,31 @@ class FaceEmbeddingWorker(QRunnable):
 
     def run(self):
         try:
+            filename = os.path.basename(self.file_path)
+            
             self.signals.progress.emit(self.file_path, "🔍 Detecting faces...")
             
             embeddings = process_faces_in_image(self.file_path)
             
             if embeddings:
                 self.signals.progress.emit(self.file_path, "📤 Uploading...")
+                
+                # Use enhanced upload with retry
                 success = upload_embedding_to_backend(
-                    self.file_path, embeddings, self.allowed_paths
+                    self.file_path, embeddings, self.allowed_paths, max_retries=3
                 )
+                
+                if success:
+                    self.signals.progress.emit(self.file_path, "✅ Upload complete")
+                else:
+                    self.signals.progress.emit(self.file_path, "❌ Upload failed")
+                    
                 self.signals.finished.emit(self.file_path, embeddings, success)
             else:
+                self.signals.progress.emit(self.file_path, "⚠️ No faces detected")
                 self.signals.finished.emit(self.file_path, [], False)
                 
         except Exception as e:
             logger.error(f"Worker error for {self.file_path}: {e}")
+            self.signals.error.emit(self.file_path, f"Worker error: {str(e)}")
             self.signals.finished.emit(self.file_path, [], False)
