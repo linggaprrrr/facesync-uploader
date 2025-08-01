@@ -9,49 +9,71 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pathlib import Path
 import json
-from retinaface import RetinaFace
 import time
 import socket
 from core.device_setup import device, resnet, API_BASE
+from collections import defaultdict, Counter
 
 # Shared detector instance untuk reuse
 _detector_instance = None
 logger = logging.getLogger(__name__)
 
-class OptimizedRetinaFaceDetector:
-    """Optimized RetinaFace detector dengan speed improvements"""
+class OptimizedYuNetDetector:
+    """Optimized YuNet detector with speed improvements"""
     
-    def __init__(self, conf_threshold=0.6, nms_threshold=0.4, max_size=640, device=None):
-        # Auto-detect device or use specified device
-        if device is None:
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = device
+    def __init__(self, model_path="models/face_detection_yunet_2023mar.onnx", conf_threshold=0.6, nms_threshold=0.3, max_size=640):
+        self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.max_size = max_size
+        self.detector = None
         self.model_warmed = False
         
-        # Print device info
-        if self.device == 'cuda':
-            print(f"✅ RetinaFace using CUDA - GPU: {torch.cuda.get_device_name()}")
-        else:
-            print("⚠️ RetinaFace using CPU")
-        
+        self._initialize_detector()
         self._warm_up_model()
+    
+    def _initialize_detector(self):
+        """Initialize YuNet detector"""
+        try:
+            # Check if model file exists
+            if not os.path.exists(self.model_path):
+                logger.error(f"❌ YuNet model file not found: {self.model_path}")
+                raise FileNotFoundError(f"Model file not found: {self.model_path}")
+            
+            # Initialize YuNet detector
+            self.detector = cv2.FaceDetectorYN.create(
+                model=self.model_path,
+                config="",
+                input_size=(320, 320),  # Default input size
+                score_threshold=self.conf_threshold,
+                nms_threshold=self.nms_threshold,
+                top_k=5000,
+                backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+                target_id=cv2.dnn.DNN_TARGET_CPU
+            )
+            
+            logger.info(f"✅ YuNet detector initialized successfully")
+            logger.info(f"   Model: {self.model_path}")
+            logger.info(f"   Confidence threshold: {self.conf_threshold}")
+            logger.info(f"   NMS threshold: {self.nms_threshold}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize YuNet detector: {e}")
+            raise e
     
     def _warm_up_model(self):
         """Warm up model dengan dummy detection"""
         try:
             dummy_img = np.ones((224, 224, 3), dtype=np.uint8) * 128
-            RetinaFace.detect_faces(dummy_img, threshold=0.9)
+            self.detector.setInputSize((dummy_img.shape[1], dummy_img.shape[0]))
+            _, faces = self.detector.detect(dummy_img)
             self.model_warmed = True
-            logger.info("✅ RetinaFace model warmed up")
+            logger.info("✅ YuNet model warmed up")
         except Exception as e:
             logger.warning(f"⚠️ Model warm up failed: {e}")
     
     def detect_with_resize(self, img):
-        """Detect dengan image resizing dan FIXED coordinate scaling"""
+        """Detect dengan image resizing dan coordinate scaling"""
         original_h, original_w = img.shape[:2]
         
         # Resize jika terlalu besar
@@ -60,89 +82,108 @@ class OptimizedRetinaFaceDetector:
             new_w = int(original_w * scale)
             new_h = int(original_h * scale)
             
-            logger.info(f"🔄 Resizing: {original_w}x{original_h} -> {new_w}x{new_h} (scale={scale:.3f})")
+            logger.debug(f"🔄 Resizing: {original_w}x{original_h} -> {new_w}x{new_h} (scale={scale:.3f})")
             
             resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             
-            faces_dict = RetinaFace.detect_faces(
-                resized_img, 
-                threshold=self.conf_threshold,
-                model=None,
-                allow_upscaling=False
-            )
+            # Set input size for YuNet
+            self.detector.setInputSize((new_w, new_h))
+            _, faces = self.detector.detect(resized_img)
             
-            # FIXED: Scale coordinates back properly
-            if faces_dict:
-                for face_key, face_data in faces_dict.items():
-                    facial_area = face_data['facial_area']  # [x1, y1, x2, y2]
+            # Scale coordinates back to original size
+            if faces is not None:
+                faces_scaled = []
+                for face in faces:
+                    # YuNet returns: [x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rcm, y_rcm, x_lcm, y_lcm, conf]
+                    x, y, w, h = face[:4]
+                    conf = face[14]
                     
-                    # Scale back ke original size
-                    x1, y1, x2, y2 = facial_area
-                    original_x1 = int(x1 / scale)
-                    original_y1 = int(y1 / scale) 
-                    original_x2 = int(x2 / scale)
-                    original_y2 = int(y2 / scale)
+                    # Scale back to original size
+                    orig_x = int(x / scale)
+                    orig_y = int(y / scale)
+                    orig_w = int(w / scale)
+                    orig_h = int(h / scale)
                     
-                    # Update dengan koordinat original
-                    face_data['facial_area'] = [original_x1, original_y1, original_x2, original_y2]
+                    # Create scaled face array with confidence
+                    scaled_face = [orig_x, orig_y, orig_w, orig_h, conf]
+                    faces_scaled.append(scaled_face)
                     
-                    logger.debug(f"Scaled bbox: ({x1},{y1},{x2},{y2}) -> ({original_x1},{original_y1},{original_x2},{original_y2})")
+                    logger.debug(f"Scaled bbox: ({x},{y},{w},{h}) -> ({orig_x},{orig_y},{orig_w},{orig_h})")
+                
+                return faces_scaled
+            else:
+                return None
         else:
-            faces_dict = RetinaFace.detect_faces(
-                img, 
-                threshold=self.conf_threshold,
-                model=None,
-                allow_upscaling=False
-            )
-        
-        return faces_dict
+            # No resizing needed
+            self.detector.setInputSize((original_w, original_h))
+            _, faces = self.detector.detect(img)
+            
+            if faces is not None:
+                # Convert to standard format [x, y, w, h, conf]
+                faces_formatted = []
+                for face in faces:
+                    x, y, w, h = face[:4]
+                    conf = face[14]
+                    faces_formatted.append([x, y, w, h, conf])
+                return faces_formatted
+            else:
+                return None
     
     def detect(self, img):
-        """Main detection method dengan FIXED bbox conversion"""
+        """Main detection method"""
         try:
             start_time = time.time()
-            faces_dict = self.detect_with_resize(img)
+            faces = self.detect_with_resize(img)
             detection_time = time.time() - start_time
             
-            logger.info(f"🔍 Detection time: {detection_time:.3f}s")
+            logger.info(f"🔍 YuNet detection time: {detection_time:.3f}s")
             
-            if not faces_dict:
+            if faces is None or len(faces) == 0:
                 return False, None
             
-            faces_list = []
+            # Filter faces by confidence and validate bounding boxes
+            valid_faces = []
             img_h, img_w = img.shape[:2]
             
-            for face_key, face_data in faces_dict.items():
-                facial_area = face_data['facial_area']  # [x1, y1, x2, y2]
-                confidence = float(face_data['score'])
+            for face in faces:
+                x, y, w, h, confidence = face
                 
-                # FIXED: Proper conversion dari [x1,y1,x2,y2] ke [x,y,w,h]
-                x1, y1, x2, y2 = facial_area
-                x = int(x1)
-                y = int(y1)
-                w = int(x2 - x1)  # ✅ width = x2 - x1
-                h = int(y2 - y1)  # ✅ height = y2 - y1
+                # Convert to int and validate
+                x, y, w, h = int(x), int(y), int(w), int(h)
+                confidence = float(confidence)
                 
-                # Validasi bbox
+                # Validate bbox
                 if w <= 0 or h <= 0:
-                    logger.warning(f"⚠️ Invalid bbox: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
+                    logger.debug(f"⚠️ Invalid bbox dimensions: w={w}, h={h}")
                     continue
                 
-                # Pastikan bbox dalam bounds image
+                # Ensure bbox is within image bounds
                 x = max(0, min(x, img_w - 1))
                 y = max(0, min(y, img_h - 1))
                 w = max(1, min(w, img_w - x))
                 h = max(1, min(h, img_h - y))
                 
-                face_array = [x, y, w, h, confidence]
-                faces_list.append(face_array)
+                # Check minimum face size
+                if w < 20 or h < 20:
+                    logger.debug(f"⚠️ Face too small: {w}x{h}")
+                    continue
                 
-                logger.debug(f"Face bbox: x={x}, y={y}, w={w}, h={h}, conf={confidence:.3f}")
+                # Filter by confidence
+                if confidence >= self.conf_threshold:
+                    valid_faces.append([x, y, w, h, confidence])
+                    logger.debug(f"✅ Valid face: x={x}, y={y}, w={w}, h={h}, conf={confidence:.3f}")
+                else:
+                    logger.debug(f"⚠️ Low confidence face: {confidence:.3f} < {self.conf_threshold}")
             
-            return True, faces_list
+            if valid_faces:
+                logger.info(f"✅ Found {len(valid_faces)} valid faces")
+                return True, valid_faces
+            else:
+                logger.info("❌ No valid faces found")
+                return False, None
             
         except Exception as e:
-            logger.error(f"❌ Error dalam deteksi: {e}")
+            logger.error(f"❌ Error in YuNet detection: {e}")
             return False, None
 
 
@@ -163,22 +204,18 @@ def convert_to_json_serializable(obj):
 
 
 def get_shared_detector():
-    """Get shared detector instance dengan GPU optimization"""
+    """Get shared YuNet detector instance"""
     global _detector_instance
     if _detector_instance is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _detector_instance = OptimizedRetinaFaceDetector(
-            device=device,
+        model_path = "models/face_detection_yunet_2023mar.onnx"
+        _detector_instance = OptimizedYuNetDetector(
+            model_path=model_path,
             conf_threshold=0.6,
-            nms_threshold=0.4,
-            max_size=640  # Bisa naik ke 1024 jika pakai GPU untuk akurasi lebih tinggi
+            nms_threshold=0.3,
+            max_size=640  # Can increase for better accuracy if needed
         )
         
-        # Log GPU usage
-        if device == 'cuda':
-            logger.info(f"🚀 Face detector using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            logger.info("💻 Face detector using CPU")
+        logger.info(f"🚀 YuNet face detector initialized: {model_path}")
             
     return _detector_instance
 
@@ -260,7 +297,7 @@ def safe_imread(file_path, flags=cv2.IMREAD_COLOR):
         return None
     
 def process_faces_in_image(file_path, original_shape=None, pad=None, scale=None):
-    """Optimized face processing dengan error handling yang lebih baik"""
+    """Optimized face processing with YuNet detector"""
     try:
         # Use safe image reading
         img = safe_imread(file_path)
@@ -276,15 +313,15 @@ def process_faces_in_image(file_path, original_shape=None, pad=None, scale=None)
             logger.warning(f"❌ Invalid image dimensions: {w}x{h}")
             return []
 
-        # Gunakan shared detector
+        # Use shared YuNet detector
         face_detector = get_shared_detector()
         success, faces = face_detector.detect(img)
 
         if not success or faces is None or len(faces) == 0:
-            logger.warning("❌ Tidak ada wajah terdeteksi.")
+            logger.warning("❌ Tidak ada wajah terdeteksi dengan YuNet.")
             return []
 
-        logger.info(f"✅ {len(faces)} wajah terdeteksi dengan RetinaFace.")
+        logger.info(f"✅ {len(faces)} wajah terdeteksi dengan YuNet.")
 
         embeddings = []
         for i, face in enumerate(faces):
@@ -428,7 +465,7 @@ def get_relative_path(file_path, allowed_paths):
         logger.error(f"Error getting relative path: {e}")
         return None
 
-# ===== ENHANCED CONNECTION HANDLING =====
+# ===== BATCH UPLOAD UNTUK BACKEND BATCH ENDPOINT =====
 
 def create_robust_session():
     """Create session dengan retry strategy untuk upload"""
@@ -454,7 +491,7 @@ def create_robust_session():
     
     # Set headers
     session.headers.update({
-        'User-Agent': 'FaceSync-Client/1.0',
+        'User-Agent': 'FaceSync-BatchClient/1.0',
         'Accept': 'application/json'
     })
     
@@ -475,26 +512,447 @@ def check_network_connectivity():
             continue
     return False
 
-def check_server_health(api_base, timeout=10):
-    """Check if server is responding"""
+def batch_upload_to_backend(files_data_list, max_retries=3):
+    """
+    FINAL FIXED: Batch upload matching your updated backend (no file_paths parameter)
+    Backend expects: files, unit_codes, photo_type_codes, outlet_codes, faces_data
+    """
+    
+    if not files_data_list:
+        logger.error("❌ No files to upload")
+        return False, "No files provided"
+    
+    logger.info(f"🚀 Starting FINAL FIXED batch upload: {len(files_data_list)} files")
+    
     try:
-        # Try to reach server with a simple request
-        test_url = f"{api_base}/health"  # Adjust sesuai endpoint server Anda
-        # Jika tidak ada health endpoint, gunakan endpoint lain yang ringan
+        # Network connectivity check
+        if not check_network_connectivity():
+            logger.error("❌ No network connectivity")
+            return False, "No network connectivity"
         
-        response = requests.get(test_url, timeout=timeout)
-        return response.status_code < 500
+        # Create robust session
+        session = create_robust_session()
+        url = f"{API_BASE}/faces/batch-upload-embedding"
         
-    except requests.exceptions.ConnectionError:
-        return False
-    except requests.exceptions.Timeout:
-        return False
-    except Exception:
-        # If no health endpoint, assume server is reachable if we get any response
-        return True
+        # Attempt upload with retry
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"📤 FINAL FIXED upload attempt {attempt + 1}/{max_retries}")
+                
+                # STEP 1: Prepare files
+                files = []
+                for i, file_data in enumerate(files_data_list):
+                    file_path = file_data['file_path']
+                    filename = os.path.basename(file_path)
+                    
+                    # Read file and add to files list
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                        files.append(('files', (filename, file_content, 'image/jpeg')))
+                
+                # STEP 2: Prepare form data (ONLY the 4 required fields)
+                data = []
+                
+                # Add all unit_codes (each as separate form field)
+                for file_data in files_data_list:
+                    data.append(('unit_codes', file_data['unit_code']))
+                
+                # Add all photo_type_codes
+                for file_data in files_data_list:
+                    data.append(('photo_type_codes', file_data['photo_type_code']))
+                
+                # Add all outlet_codes
+                for file_data in files_data_list:
+                    data.append(('outlet_codes', file_data['outlet_code']))
+                
+                # Add all faces_data (convert to JSON strings)
+                for file_data in files_data_list:
+                    serializable_faces = convert_to_json_serializable(file_data['faces'])
+                    faces_json = safe_json_dumps(serializable_faces)
+                    data.append(('faces_data', faces_json))
+                
+                # STEP 3: Validation logging
+                logger.info(f"📊 FINAL FIXED format validation:")
+                logger.info(f"   Files count: {len(files)}")
+                logger.info(f"   Form data entries: {len(data)}")
+                
+                # Count fields by type
+                field_counts = Counter([item[0] for item in data])
+                logger.info(f"   Field counts: {dict(field_counts)}")
+                
+                # Validate all fields have same count as files
+                expected_count = len(files_data_list)
+                validation_passed = True
+                
+                required_fields = ['unit_codes', 'photo_type_codes', 'outlet_codes', 'faces_data']
+                for field_name in required_fields:
+                    count = field_counts.get(field_name, 0)
+                    if count != expected_count:
+                        logger.error(f"❌ Field '{field_name}' count mismatch: {count} != {expected_count}")
+                        validation_passed = False
+                    else:
+                        logger.info(f"✅ Field '{field_name}' count correct: {count}")
+                
+                if not validation_passed:
+                    return False, "Form data validation failed - field count mismatch"
+                
+                # STEP 4: Make the request
+                current_timeout = 120 + (attempt * 60)
+                
+                logger.info(f"🌐 Making request to: {url}")
+                logger.info(f"⏱️ Timeout: {current_timeout}s")
+                
+                response = session.post(
+                    url,
+                    files=files,
+                    data=data,
+                    timeout=current_timeout
+                )
+                
+                logger.info(f"📡 FINAL FIXED Response status: {response.status_code}")
+                
+                # STEP 5: Handle response
+                if response.status_code in [200, 207]:
+                    try:
+                        result = response.json()
+                        successful = result.get('successful_uploads', 0)
+                        failed = result.get('failed_uploads', 0)
+                        
+                        logger.info(f"✅ FINAL FIXED upload completed: {successful} successful, {failed} failed")
+                        
+                        # Log details if available
+                        if 'successful_files' in result:
+                            logger.info(f"📋 Successful files: {len(result['successful_files'])}")
+                            for success_file in result['successful_files'][:3]:  # Log first 3 successes
+                                logger.info(f"   ✅ {success_file.get('filename', 'unknown')}: {success_file.get('faces_count', 0)} faces")
+                        
+                        if 'failed_files' in result:
+                            logger.info(f"📋 Failed files: {len(result['failed_files'])}")
+                            for failed_file in result['failed_files'][:3]:  # Log first 3 failures
+                                logger.warning(f"   ❌ {failed_file.get('filename', 'unknown')}: {failed_file.get('error', 'unknown error')}")
+                        
+                        return True, f"Batch upload completed: {successful}/{len(files_data_list)} successful"
+                        
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ Invalid JSON response: {e}")
+                        logger.error(f"❌ Raw response: {response.text[:500]}")
+                        return False, f"Invalid JSON response: {str(e)}"
+                
+                elif response.status_code == 422:
+                    # Validation error - log details and don't retry
+                    error_text = response.text
+                    logger.error(f"❌ VALIDATION ERROR 422:")
+                    logger.error(f"❌ Error details: {error_text}")
+                    
+                    try:
+                        error_json = response.json()
+                        if 'detail' in error_json:
+                            for error_detail in error_json['detail']:
+                                logger.error(f"   Field: {error_detail.get('loc', 'unknown')}")
+                                logger.error(f"   Error: {error_detail.get('msg', 'unknown')}")
+                                logger.error(f"   Input: {str(error_detail.get('input', 'unknown'))[:100]}")
+                    except:
+                        pass
+                    
+                    return False, f"Validation error: {error_text[:300]}"
+                
+                elif response.status_code == 400:
+                    # Client error (like field count mismatch) - don't retry
+                    error_text = response.text
+                    logger.error(f"❌ CLIENT ERROR 400:")
+                    logger.error(f"❌ Error details: {error_text}")
+                    return False, f"Client error: {error_text[:300]}"
+                
+                elif response.status_code in [429, 500, 502, 503, 504]:
+                    # Server errors - retry
+                    logger.warning(f"⚠️ Server error {response.status_code} on attempt {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 3
+                        logger.info(f"⏳ Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return False, f"Server error {response.status_code} after {max_retries} attempts"
+                
+                else:
+                    # Other client errors
+                    error_text = response.text
+                    logger.error(f"❌ Client error {response.status_code}")
+                    logger.error(f"❌ Error details: {error_text[:1000]}")
+                    
+                    return False, f"Client error {response.status_code}: {error_text[:200]}"
+            
+            except requests.exceptions.Timeout as e:
+                logger.error(f"⏰ Timeout error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏳ Retrying after timeout...")
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return False, f"Timeout after {max_retries} attempts"
+            
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"🔌 Connection error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏳ Retrying after connection error...")
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return False, f"Connection error after {max_retries} attempts"
+            
+            except Exception as e:
+                logger.error(f"💥 Unexpected error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return False, f"Unexpected error: {str(e)}"
+        
+        return False, "Upload failed after all retries"
+        
+    except Exception as e:
+        logger.error(f"❌ FINAL FIXED fatal error: {e}")
+        return False, f"Fatal error: {str(e)}"
 
+    finally:
+        try:
+            if 'session' in locals():
+                session.close()
+        except:
+            pass
+
+def validate_files_data(files_data_list):
+    """
+    Validate the files_data_list structure for the final backend
+    """
+    logger.info("🔍 Validating files data structure...")
+    
+    if not files_data_list:
+        logger.error("❌ Empty files data list")
+        return False, "No files to validate"
+    
+    required_fields = ['file_path', 'unit_code', 'photo_type_code', 'outlet_code', 'faces']
+    errors = []
+    
+    for i, file_data in enumerate(files_data_list):
+        # Check required fields
+        for field in required_fields:
+            if field not in file_data:
+                errors.append(f"File {i}: Missing required field '{field}'")
+            elif not file_data[field] and field != 'faces':  # faces can be empty list
+                errors.append(f"File {i}: Empty value for field '{field}'")
+        
+        # Check file exists
+        if 'file_path' in file_data:
+            if not os.path.exists(file_data['file_path']):
+                errors.append(f"File {i}: File not found: {file_data['file_path']}")
+            elif not os.access(file_data['file_path'], os.R_OK):
+                errors.append(f"File {i}: File not readable: {file_data['file_path']}")
+        
+        # Check faces data
+        if 'faces' in file_data:
+            if not isinstance(file_data['faces'], list):
+                errors.append(f"File {i}: faces must be a list")
+            elif len(file_data['faces']) == 0:
+                logger.warning(f"⚠️ File {i}: No faces detected")
+        
+        # Check code fields are strings
+        for code_field in ['unit_code', 'photo_type_code', 'outlet_code']:
+            if code_field in file_data and not isinstance(file_data[code_field], str):
+                errors.append(f"File {i}: {code_field} must be a string")
+    
+    if errors:
+        logger.error(f"❌ Validation failed with {len(errors)} errors:")
+        for error in errors[:10]:  # Log first 10 errors
+            logger.error(f"   {error}")
+        return False, f"Validation failed: {len(errors)} errors"
+    
+    logger.info(f"✅ Validation passed for {len(files_data_list)} files")
+    return True, "Validation successful"
+
+def process_batch_faces_and_upload(files_list, allowed_paths):
+    """
+    FINAL VERSION: Process multiple files and upload with YuNet detector
+    """
+    logger.info(f"🔄 FINAL processing batch: {len(files_list)} files")
+    
+    # Process all files for faces first
+    files_data = []
+    processing_errors = []
+    
+    for file_path in files_list:
+        try:
+            filename = os.path.basename(file_path)
+            logger.info(f"🔍 Processing faces: {filename}")
+            
+            # Validate file exists and is readable
+            if not os.path.exists(file_path):
+                processing_errors.append(f"File not found: {filename}")
+                continue
+            
+            if not os.access(file_path, os.R_OK):
+                processing_errors.append(f"File not readable: {filename}")
+                continue
+            
+            # Check file size
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                processing_errors.append(f"Empty file: {filename}")
+                continue
+            
+            # Process faces in image with YuNet
+            logger.debug(f"   Detecting faces with YuNet in: {filename}")
+            embeddings = process_faces_in_image(file_path)
+            
+            if not embeddings:
+                processing_errors.append(f"No faces detected: {filename}")
+                continue
+            
+            logger.debug(f"   Found {len(embeddings)} faces in: {filename}")
+            
+            # Parse path codes
+            relative_path = get_relative_path(file_path, allowed_paths)
+            if not relative_path:
+                processing_errors.append(f"Invalid path: {filename}")
+                continue
+            
+            unit_code, photo_type_code, outlet_code = parse_codes_from_relative_path(
+                relative_path, allowed_paths[0]
+            )
+            
+            if not all([unit_code, outlet_code, photo_type_code]):
+                processing_errors.append(f"Path parsing failed: {filename} (unit={unit_code}, outlet={outlet_code}, photo_type={photo_type_code})")
+                continue
+            
+            # Validate codes are strings
+            if not all(isinstance(code, str) for code in [unit_code, outlet_code, photo_type_code]):
+                processing_errors.append(f"Invalid code types: {filename}")
+                continue
+            
+            # Add to batch data
+            files_data.append({
+                'file_path': file_path,
+                'unit_code': unit_code,
+                'photo_type_code': photo_type_code,  
+                'outlet_code': outlet_code,
+                'faces': embeddings
+            })
+            
+            logger.info(f"✅ Processed: {filename} ({len(embeddings)} faces) - {unit_code}/{outlet_code}/{photo_type_code}")
+            
+        except Exception as e:
+            error_msg = f"Processing error for {os.path.basename(file_path)}: {str(e)}"
+            processing_errors.append(error_msg)
+            logger.error(f"❌ {error_msg}")
+    
+    # Log processing summary
+    logger.info(f"📊 Processing complete: {len(files_data)} ready for upload, {len(processing_errors)} errors")
+    
+    if processing_errors:
+        logger.warning(f"⚠️ Processing errors ({len(processing_errors)}):")
+        for error in processing_errors[:5]:  # Log first 5 errors
+            logger.warning(f"   {error}")
+        if len(processing_errors) > 5:
+            logger.warning(f"   ... and {len(processing_errors) - 5} more errors")
+    
+    if not files_data:
+        return False, "No files ready for upload"
+    
+    # Validate files data structure
+    is_valid, validation_message = validate_files_data(files_data)
+    if not is_valid:
+        return False, f"Validation failed: {validation_message}"
+    
+    # Upload batch using the final fixed version
+    logger.info("🚀 Starting upload with FINAL FIXED version...")
+    success, message = batch_upload_to_backend(files_data)
+    
+    if success:
+        logger.info(f"✅ FINAL FIXED upload successful: {message}")
+    else:
+        logger.error(f"❌ FINAL FIXED upload failed: {message}")
+    
+    return success, message
+
+def debug_final_structure(files_data_list):
+    """
+    Debug function to show exactly what will be sent to the final backend
+    """
+    logger.info("🧪 DEBUG: Final structure validation")
+    
+    if not files_data_list:
+        logger.error("No test data provided")
+        return
+    
+    # Show what we'll send
+    files_count = len(files_data_list)
+    logger.info(f"Files to upload: {files_count}")
+    
+    # Check each required field
+    required_fields = ['unit_code', 'photo_type_code', 'outlet_code', 'faces']
+    
+    for field in required_fields:
+        values = [fd.get(field, 'MISSING') for fd in files_data_list]
+        logger.info(f"{field}: {len(values)} values")
+        for i, value in enumerate(values[:3]):  # Show first 3
+            if field == 'faces':
+                logger.info(f"  [{i}] {type(value).__name__} with {len(value) if isinstance(value, list) else 'N/A'} items")
+            else:
+                logger.info(f"  [{i}] {value}")
+        if len(values) > 3:
+            logger.info(f"  ... and {len(values) - 3} more")
+    
+    # Validate all fields have same count
+    logger.info("✅ All field counts match files count" if all(
+        len([fd.get(field) for fd in files_data_list]) == files_count 
+        for field in required_fields
+    ) else "❌ Field count mismatch detected")
+
+class BatchFaceEmbeddingWorkerSignals(QObject):
+    finished = pyqtSignal(str, bool, str)  # result_summary, success, message
+    progress = pyqtSignal(str, str)  # current_file, status
+    error = pyqtSignal(str, str)  # file_path, error_message
+    batch_completed = pyqtSignal(int, int)  # successful_count, failed_count
+
+class BatchFaceEmbeddingWorker(QRunnable):
+    """NEW: Batch worker yang menggunakan YuNet detector dan backend batch endpoint"""
+    
+    def __init__(self, files_list, allowed_paths):
+        super().__init__()
+        self.files_list = files_list
+        self.allowed_paths = allowed_paths
+        self.signals = BatchFaceEmbeddingWorkerSignals()
+
+    def run(self):
+        try:
+            batch_size = len(self.files_list)
+            self.signals.progress.emit("batch", f"🔄 Processing batch of {batch_size} files with YuNet...")
+            
+            # Process and upload batch
+            success, message = process_batch_faces_and_upload(self.files_list, self.allowed_paths)
+            
+            if success:
+                self.signals.progress.emit("batch", "✅ Batch upload completed")
+                self.signals.finished.emit(f"Batch successful: {batch_size} files", True, message)
+                self.signals.batch_completed.emit(batch_size, 0)  # All successful for now
+            else:
+                self.signals.progress.emit("batch", "❌ Batch upload failed")
+                self.signals.finished.emit(f"Batch failed: {batch_size} files", False, message)
+                self.signals.batch_completed.emit(0, batch_size)  # All failed for now
+                
+        except Exception as e:
+            error_message = f"Batch worker error: {str(e)}"
+            logger.error(f"❌ {error_message}")
+            self.signals.error.emit("batch", error_message)
+            self.signals.finished.emit("Batch error", False, error_message)
+            self.signals.batch_completed.emit(0, len(self.files_list))
+
+# Legacy single upload function (kept for compatibility)
 def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
-    """Upload embedding dengan enhanced error handling dan retry mechanism"""
+    """
+    LEGACY: Single file upload - kept for backward compatibility
+    For new implementations, use batch_upload_to_backend instead
+    """
     
     filename = os.path.basename(file_path)
     
@@ -513,141 +971,27 @@ def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
             logger.error(f"❌ Gagal parsing folder path: {filename}")
             return False
 
-        # Step 2: Prepare data
-        serializable_faces = convert_to_json_serializable(faces)
+        # Step 2: Use batch upload with single file for consistency
+        files_data = [{
+            'file_path': file_path,
+            'unit_code': unit_code,
+            'photo_type_code': photo_type_code,
+            'outlet_code': outlet_code,
+            'faces': faces
+        }]
         
-        data = {
-            "unit_code": unit_code,
-            "photo_type_code": photo_type_code,
-            "outlet_code": outlet_code,            
-            "faces": safe_json_dumps(serializable_faces),
-        }
-
-        # Step 3: Network connectivity check
-        logger.info(f"🔍 Checking connectivity for {filename}...")
-        if not check_network_connectivity():
-            logger.error(f"❌ No network connectivity for {filename}")
-            return False
-
-        # Step 4: Create robust session
-        session = create_robust_session()
-        url = f"{API_BASE}/faces/upload-embedding"
-
-        # Step 5: Upload with retry mechanism
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries} for {filename}")
-                
-                # Check server health before upload (except first attempt)
-                if attempt > 0:
-                    logger.info(f"🏥 Checking server health before retry...")
-                    if not check_server_health(API_BASE):
-                        logger.warning(f"⚠️ Server health check failed on attempt {attempt + 1}")
-                        if attempt < max_retries - 1:
-                            wait_time = (2 ** attempt) * 3  # 3s, 6s, 12s
-                            logger.info(f"⏳ Waiting {wait_time}s before next attempt...")
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            logger.error(f"❌ Server unreachable after all attempts: {filename}")
-                            return False
-
-                # Attempt upload
-                with open(file_path, "rb") as f:
-                    files = {"file": f}
-                    
-                    # Progressive timeout - increase for each retry
-                    current_timeout = 30 + (attempt * 15)  # 30s, 45s, 60s
-                    
-                    response = session.post(
-                        url, 
-                        data=data, 
-                        files=files, 
-                        timeout=current_timeout
-                    )
-
-                # Handle response
-                if response.status_code == 200:
-                    logger.info(f"✅ Upload berhasil: {filename}")
-                    return True
-                    
-                elif response.status_code in [429, 500, 502, 503, 504]:
-                    # Server errors - retry
-                    logger.warning(f"⚠️ Server error {response.status_code} on attempt {attempt + 1}: {filename}")
-                    if attempt < max_retries - 1:
-                        wait_time = (2 ** attempt) * 2  # 2s, 4s, 8s
-                        logger.info(f"⏳ Retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(f"❌ Upload failed after retries - Server error {response.status_code}: {filename}")
-                        return False
-                        
-                else:
-                    # Client errors (4xx) - don't retry
-                    logger.error(f"❌ Upload failed - Client error {response.status_code}: {filename}")
-                    logger.error(f"Response: {response.text}")
-                    return False
-
-            except requests.exceptions.Timeout as e:
-                logger.warning(f"⏰ Timeout on attempt {attempt + 1}: {filename}")
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 2
-                    logger.info(f"⏳ Retrying in {wait_time}s with longer timeout...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"❌ Upload timeout after all attempts: {filename}")
-                    return False
-                    
-            except requests.exceptions.ConnectionError as e:
-                logger.warning(f"🔌 Connection error on attempt {attempt + 1}: {filename}")
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 4  # 4s, 8s, 16s for connection errors
-                    logger.info(f"⏳ Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"❌ Connection error - server tidak dapat dijangkau: {filename}")
-                    return False
-                    
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"📡 Request error on attempt {attempt + 1}: {filename} - {str(e)}")
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 2
-                    logger.info(f"⏳ Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"❌ Request failed after all attempts: {filename}")
-                    return False
-                    
-            except Exception as e:
-                logger.warning(f"💥 Unexpected error on attempt {attempt + 1}: {filename} - {str(e)}")
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) * 2
-                    logger.info(f"⏳ Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.error(f"❌ Upload error after all attempts: {filename} - {str(e)}")
-                    return False
-
-        # Should not reach here
-        logger.error(f"❌ Upload failed: {filename} - Exhausted all retry attempts")
-        return False
-
+        success, message = batch_upload_to_backend(files_data, max_retries)
+        
+        if success:
+            logger.info(f"✅ Single upload successful: {filename}")
+        else:
+            logger.error(f"❌ Single upload failed: {filename} - {message}")
+        
+        return success
+        
     except Exception as e:
-        logger.error(f"❌ Fatal upload error: {filename} - {str(e)}")
+        logger.error(f"❌ Single upload error: {filename} - {str(e)}")
         return False
-    
-    finally:
-        # Cleanup session if created
-        try:
-            if 'session' in locals():
-                session.close()
-        except:
-            pass
 
 class FaceEmbeddingWorkerSignals(QObject):
     finished = pyqtSignal(str, list, bool)  # file_path, embeddings, success
@@ -655,7 +999,7 @@ class FaceEmbeddingWorkerSignals(QObject):
     error = pyqtSignal(str, str) 
     
 class FaceEmbeddingWorker(QRunnable):
-    """Optimized worker dengan progress reporting dan robust upload"""
+    """LEGACY: Single file worker with YuNet - kept for backward compatibility"""
     
     def __init__(self, file_path, allowed_paths):
         super().__init__()
@@ -667,14 +1011,14 @@ class FaceEmbeddingWorker(QRunnable):
         try:
             filename = os.path.basename(self.file_path)
             
-            self.signals.progress.emit(self.file_path, "🔍 Detecting faces...")
+            self.signals.progress.emit(self.file_path, "🔍 Detecting faces with YuNet...")
             
             embeddings = process_faces_in_image(self.file_path)
             
             if embeddings:
                 self.signals.progress.emit(self.file_path, "📤 Uploading...")
                 
-                # Use enhanced upload with retry
+                # Use single upload (which internally uses batch with 1 file)
                 success = upload_embedding_to_backend(
                     self.file_path, embeddings, self.allowed_paths, max_retries=3
                 )
