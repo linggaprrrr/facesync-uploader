@@ -23,6 +23,7 @@ a = Analysis(
         ('ui/*', 'ui'),              # Folder UI Qt5
         ('core/*', 'core'),          # Folder Core logic
         ('utils/*', 'utils'),        # Folder utils/tools
+        ('models/*', 'models'),      # Folder model
         
     ],
     hiddenimports=hiddenimports,
@@ -41,7 +42,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='FaceUploaderApp 1.1.0',
+    name='FaceUploaderApp 1.2.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -57,5 +58,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    name='FaceUploaderApp v1.1.0'
+    name='FaceUploaderApp v1.2.0'
 )
