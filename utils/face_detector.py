@@ -18,11 +18,17 @@ from collections import defaultdict, Counter
 _detector_instance = None
 logger = logging.getLogger(__name__)
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and PyInstaller .exe"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.abspath(relative_path)
+
 class OptimizedYuNetDetector:
     """Optimized YuNet detector with speed improvements"""
     
     def __init__(self, model_path="models/face_detection_yunet_2023mar.onnx", conf_threshold=0.6, nms_threshold=0.3, max_size=640):
-        self.model_path = model_path
+        self.model_path = resource_path(model_path)
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.max_size = max_size
