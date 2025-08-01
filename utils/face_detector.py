@@ -11,6 +11,7 @@ from pathlib import Path
 import json
 import time
 import socket
+import sys
 from core.device_setup import device, resnet, API_BASE
 from collections import defaultdict, Counter
 
