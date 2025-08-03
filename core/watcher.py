@@ -1,3 +1,4 @@
+# core/watcher.py - FULLY OPTIMIZED VERSION
 import time
 import threading
 from watchdog.observers import Observer
@@ -5,211 +6,338 @@ from watchdog.events import FileSystemEventHandler
 import os
 from datetime import datetime
 
-class FolderWatcher(FileSystemEventHandler):
+class OptimizedFolderWatcher(FileSystemEventHandler):
+    """High-performance folder watcher with duplicate prevention"""
+    
     def __init__(self, folder_path, on_new_file, on_delete_file):
         self.folder_path = folder_path
         self.on_new_file = on_new_file
         self.on_delete_file = on_delete_file
+        
         # Extended image formats
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.svg', '.webp']
         
-        # Track known files untuk periodic scanning
-        self.known_files = set()
-        self.last_scan_time = datetime.now()
+        # HIGH PERFORMANCE: Separate tracking sets
+        self.processed_files = set()    # Successfully processed files
+        self.pending_files = set()      # Currently being processed
+        self.failed_files = set()       # Failed processing
         
-        # Initialize known files
+        # Thread safety
+        self.lock = threading.Lock()
+        
+        # Performance settings
+        self.fast_mode = True           # Use fast validation by default
+        self.scan_interval = 8          # Scan every 8 seconds (optimized)
+        
+        # Initialize existing files
         self._scan_existing_files()
         
-        # Start periodic scanning thread
+        # Start optimized periodic scanning
         self.scanning = True
-        self.scan_thread = threading.Thread(target=self._periodic_scan, daemon=True)
+        self.scan_thread = threading.Thread(target=self._optimized_periodic_scan, daemon=True)
         self.scan_thread.start()
+        
+        print(f"✅ OptimizedFolderWatcher started for: {os.path.basename(folder_path)}")
+        print(f"📊 Initial state: {len(self.processed_files)} existing files marked as processed")
 
     def _scan_existing_files(self):
-        """Scan existing files to populate known_files set"""
+        """Mark existing files as already processed to prevent reprocessing"""
         try:
-            for root, dirs, files in os.walk(self.folder_path):
-                for file in files:
-                    if self._is_image_file(file):
-                        file_path = os.path.join(root, file)
-                        if os.path.exists(file_path):
-                            self.known_files.add(file_path)
+            with self.lock:
+                for root, dirs, files in os.walk(self.folder_path):
+                    for file in files:
+                        if self._is_image_file(file):
+                            file_path = os.path.join(root, file)
+                            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                                self.processed_files.add(file_path)
+                                
         except Exception as e:
-            print(f"Error scanning existing files: {e}")
+            print(f"❌ Error scanning existing files: {e}")
 
     def _is_image_file(self, filename):
         """Check if file is an image"""
         ext = os.path.splitext(filename)[1].lower()
         return ext in self.image_extensions
 
-    def _periodic_scan(self):
-        """Periodic scan untuk mendeteksi file yang tidak terdeteksi oleh watchdog"""
+    def _optimized_periodic_scan(self):
+        """Optimized periodic scan with better performance"""
         while self.scanning:
             try:
-                # Scan setiap 8 detik (lebih lambat untuk mengurangi overhead)
-                time.sleep(8)
-                self._check_for_new_files()
-                self._check_for_deleted_files()
+                time.sleep(self.scan_interval)
+                self._scan_for_new_files()
+                self._cleanup_deleted_files()
             except Exception as e:
-                print(f"Error in periodic scan: {e}")
-                time.sleep(8)  # Continue scanning even after error
+                print(f"❌ Error in periodic scan: {e}")
+                time.sleep(self.scan_interval)
 
-    def _check_for_new_files(self):
-        """Check for new files that weren't detected by watchdog"""
+    def _scan_for_new_files(self):
+        """Efficient scan for new files"""
         try:
-            current_files = set()
+            new_files_found = 0
             
             for root, dirs, files in os.walk(self.folder_path):
                 for file in files:
                     if self._is_image_file(file):
                         file_path = os.path.join(root, file)
-                        if os.path.exists(file_path):
-                            current_files.add(file_path)
-                            
-                            # File baru yang belum diketahui
-                            if file_path not in self.known_files:
-                                # Cek apakah file sudah stabil (selesai transfer)
-                                if self._is_file_stable(file_path):
-                                    print(f"New file detected via periodic scan: {file_path}")
-                                    self.known_files.add(file_path)
-                                    self.on_new_file(file_path)
-            
-            # Update known files list
-            # Note: Hanya tambahkan file baru, jangan hapus yang lama di sini
-            # karena file deletion akan ditangani oleh _check_for_deleted_files
-            
-        except Exception as e:
-            print(f"Error checking for new files: {e}")
-
-    def _check_for_deleted_files(self):
-        """Check for deleted files"""
-        try:
-            files_to_remove = []
-            for file_path in self.known_files:
-                if not os.path.exists(file_path):
-                    files_to_remove.append(file_path)
-                    print(f"File deleted detected via periodic scan: {file_path}")
-                    self.on_delete_file(file_path)
-            
-            # Remove deleted files from known_files
-            for file_path in files_to_remove:
-                self.known_files.discard(file_path)
-                
-        except Exception as e:
-            print(f"Error checking for deleted files: {e}")
-
-    def _is_file_stable(self, file_path, stable_time=10, max_retries=3):
-        """
-        Check if file is stable (finished transferring)
-        File dianggap stabil jika ukurannya tidak berubah dalam waktu tertentu
-        """
-        for attempt in range(max_retries):
-            try:
-                if not os.path.exists(file_path):
-                    print(f"File not found on attempt {attempt + 1}: {file_path}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)  # Wait before retry
-                        continue
-                    return False
-                    
-                # Get initial size and mtime
-                initial_size = os.path.getsize(file_path)
-                initial_mtime = os.path.getmtime(file_path)
-                
-                # Skip empty files immediately
-                if initial_size == 0:
-                    print(f"Empty file detected, waiting: {file_path}")
-                    if attempt < max_retries - 1:
-                        time.sleep(stable_time)
-                        continue
-                    return False
-                
-                # Wait for stable_time seconds
-                time.sleep(stable_time)
-                
-                # Check if file still exists and size/mtime unchanged
-                if not os.path.exists(file_path):
-                    print(f"File disappeared during stability check: {file_path}")
-                    return False
-                    
-                current_size = os.path.getsize(file_path)
-                current_mtime = os.path.getmtime(file_path)
-                
-                # File is stable if size and mtime unchanged
-                if (initial_size == current_size and 
-                    initial_mtime == current_mtime and 
-                    initial_size > 0):
-                    print(f"File stable after {stable_time}s: {os.path.basename(file_path)} ({initial_size} bytes)")
-                    return True
-                else:
-                    print(f"File still changing on attempt {attempt + 1}: {os.path.basename(file_path)} "
-                          f"({initial_size} -> {current_size} bytes)")
-                    if attempt < max_retries - 1:
-                        # Increase wait time for next attempt
-                        stable_time += 2
-                        continue
                         
-            except Exception as e:
-                print(f"Error checking file stability for {file_path} (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
+                        if not os.path.exists(file_path):
+                            continue
+                            
+                        with self.lock:
+                            # Skip if already tracked
+                            if (file_path in self.processed_files or 
+                                file_path in self.pending_files):
+                                continue
+                        
+                        # New file detected
+                        new_files_found += 1
+                        print(f"🔍 Periodic scan found new file: {os.path.basename(file_path)}")
+                        self._handle_new_file(file_path, source="periodic_scan")
+            
+            if new_files_found > 0:
+                print(f"📊 Periodic scan completed: {new_files_found} new files found")
+                        
+        except Exception as e:
+            print(f"❌ Error scanning for new files: {e}")
+
+    def _cleanup_deleted_files(self):
+        """Clean up deleted files from tracking sets"""
+        try:
+            with self.lock:
+                all_tracked_files = (self.processed_files | self.pending_files | self.failed_files)
+                deleted_files = []
+                
+                for file_path in all_tracked_files:
+                    if not os.path.exists(file_path):
+                        deleted_files.append(file_path)
+                
+                # Remove deleted files from all sets
+                for file_path in deleted_files:
+                    self.processed_files.discard(file_path)
+                    self.pending_files.discard(file_path)
+                    self.failed_files.discard(file_path)
+                    print(f"🗑️ Cleaned up deleted file: {os.path.basename(file_path)}")
+                    # Notify deletion
+                    self.on_delete_file(file_path)
+                    
+        except Exception as e:
+            print(f"❌ Error cleaning up deleted files: {e}")
+
+    def _handle_new_file(self, file_path, source="unknown"):
+        """Handle new file with duplicate prevention"""
+        
+        # Prevent duplicate processing
+        with self.lock:
+            if (file_path in self.processed_files or 
+                file_path in self.pending_files):
+                print(f"⚠️ DUPLICATE PREVENTED: {os.path.basename(file_path)} (source: {source})")
+                return
+            
+            # Mark as pending
+            self.pending_files.add(file_path)
+        
+        print(f"⚡ Processing new file from {source}: {os.path.basename(file_path)}")
+        
+        # Process file in background thread
+        if self.fast_mode:
+            # Fast processing
+            processing_thread = threading.Thread(
+                target=self._fast_process_file,
+                args=(file_path, source),
+                daemon=True
+            )
+        else:
+            # Thorough processing
+            processing_thread = threading.Thread(
+                target=self._thorough_process_file,
+                args=(file_path, source),
+                daemon=True
+            )
+        
+        processing_thread.start()
+
+    def _fast_process_file(self, file_path, source):
+        """Fast file processing - optimized for speed"""
+        try:
+            # Quick validation only
+            if self._fast_file_check(file_path):
+                with self.lock:
+                    self.pending_files.discard(file_path)
+                    self.processed_files.add(file_path)
+                
+                print(f"✅ FAST: File ready for processing: {os.path.basename(file_path)}")
+                self.on_new_file(file_path)
+            else:
+                with self.lock:
+                    self.pending_files.discard(file_path)
+                    self.failed_files.add(file_path)
+                
+                print(f"❌ FAST: File failed validation: {os.path.basename(file_path)}")
+                
+        except Exception as e:
+            with self.lock:
+                self.pending_files.discard(file_path)
+                self.failed_files.add(file_path)
+            print(f"❌ FAST: Error processing {os.path.basename(file_path)}: {e}")
+
+    def _thorough_process_file(self, file_path, source):
+        """Thorough file processing - for critical files"""
+        try:
+            if self._thorough_file_check(file_path):
+                with self.lock:
+                    self.pending_files.discard(file_path)
+                    self.processed_files.add(file_path)
+                
+                print(f"✅ THOROUGH: File ready for processing: {os.path.basename(file_path)}")
+                self.on_new_file(file_path)
+            else:
+                with self.lock:
+                    self.pending_files.discard(file_path)
+                    self.failed_files.add(file_path)
+                
+                print(f"❌ THOROUGH: File failed validation: {os.path.basename(file_path)}")
+                
+        except Exception as e:
+            with self.lock:
+                self.pending_files.discard(file_path)
+                self.failed_files.add(file_path)
+            print(f"❌ THOROUGH: Error processing {os.path.basename(file_path)}: {e}")
+
+    def _fast_file_check(self, file_path):
+        """Fast file validation - 1-2 seconds only"""
+        try:
+            # Wait 1 second
+            time.sleep(1)
+            
+            if not os.path.exists(file_path):
+                return False
+                
+            size = os.path.getsize(file_path)
+            if size == 0:
+                # Wait a bit more for empty files
+                time.sleep(2)
+                size = os.path.getsize(file_path)
+                
+            # File must have content
+            return size > 0
+            
+        except Exception:
+            return False
+
+    def _thorough_file_check(self, file_path):
+        """Thorough file validation - for critical files"""
+        try:
+            for attempt in range(3):
+                if not os.path.exists(file_path):
+                    time.sleep(1)
                     continue
                     
-        return False
+                initial_size = os.path.getsize(file_path)
+                if initial_size == 0:
+                    time.sleep(2)
+                    continue
+                
+                # Wait for stability
+                time.sleep(3 + attempt)
+                
+                if (os.path.exists(file_path) and 
+                    os.path.getsize(file_path) == initial_size and 
+                    initial_size > 0):
+                    return True
+                    
+            return False
+            
+        except Exception:
+            return False
 
     def on_created(self, event):
         """Handle watchdog created event"""
-        if not event.is_directory:
-            if self._is_image_file(event.src_path):
-                print(f"New file detected via watchdog: {event.src_path}")
-                self.known_files.add(event.src_path)
-                self.on_new_file(event.src_path)
-    
+        if not event.is_directory and self._is_image_file(event.src_path):
+            print(f"👁️ Watchdog detected: {os.path.basename(event.src_path)}")
+            self._handle_new_file(event.src_path, source="watchdog")
+
     def on_deleted(self, event):
         """Handle watchdog deleted event"""
-        if not event.is_directory:
-            if self._is_image_file(event.src_path):
-                print(f"File deleted via watchdog: {event.src_path}")
-                self.known_files.discard(event.src_path)
-                self.on_delete_file(event.src_path)
+        if not event.is_directory and self._is_image_file(event.src_path):
+            with self.lock:
+                self.processed_files.discard(event.src_path)
+                self.pending_files.discard(event.src_path)
+                self.failed_files.discard(event.src_path)
+            print(f"🗑️ Watchdog detected deletion: {os.path.basename(event.src_path)}")
+            self.on_delete_file(event.src_path)
+
+    def set_fast_mode(self, enabled):
+        """Toggle between fast and thorough processing"""
+        self.fast_mode = enabled
+        mode = "FAST" if enabled else "THOROUGH"
+        print(f"⚡ File processing mode: {mode}")
+
+    def retry_failed_files(self):
+        """Retry processing failed files"""
+        with self.lock:
+            failed_list = list(self.failed_files)
+            self.failed_files.clear()
+        
+        print(f"🔄 Retrying {len(failed_list)} failed files")
+        
+        for file_path in failed_list:
+            if os.path.exists(file_path):
+                self._handle_new_file(file_path, source="retry")
+
+    def get_stats(self):
+        """Get current processing statistics"""
+        with self.lock:
+            return {
+                'processed': len(self.processed_files),
+                'pending': len(self.pending_files),
+                'failed': len(self.failed_files),
+                'total_tracked': len(self.processed_files) + len(self.pending_files) + len(self.failed_files)
+            }
 
     def stop_scanning(self):
-        """Stop periodic scanning"""
+        """Stop the watcher"""
         self.scanning = False
         if self.scan_thread.is_alive():
             self.scan_thread.join(timeout=10)
+        print("🔄 OptimizedFolderWatcher stopped")
 
 def start_watcher(folder_path, on_new_file, on_delete_file, recursive=True):
     """
-    Start watching a folder for image file changes
-    Includes both watchdog events and periodic scanning for FTP transfers
-    
-    Args:
-        folder_path: Path to watch
-        on_new_file: Callback for new files
-        on_delete_file: Callback for deleted files  
-        recursive: Whether to watch subfolders (default: True)
+    Start optimized folder watcher
+    Returns tuple of (observer, event_handler) for proper cleanup
     """
-    event_handler = FolderWatcher(folder_path, on_new_file, on_delete_file)
-    observer = Observer()
-    observer.schedule(event_handler, folder_path, recursive=recursive)
-    observer.start()
-    print(f"Started watching: {folder_path} (recursive={recursive})")
-    print("Periodic scanning enabled for FTP transfers")
-    return observer, event_handler
+    try:
+        event_handler = OptimizedFolderWatcher(folder_path, on_new_file, on_delete_file)
+        observer = Observer()
+        observer.schedule(event_handler, folder_path, recursive=recursive)
+        observer.start()
+        
+        print(f"🚀 Started optimized watching: {folder_path}")
+        print(f"📡 Watchdog + Periodic scan enabled (recursive={recursive})")
+        
+        return (observer, event_handler)
+        
+    except Exception as e:
+        print(f"❌ Error starting watcher: {e}")
+        return None
 
 def stop_watcher(observer_and_handler):
-    """Stop the file watcher"""
-    if isinstance(observer_and_handler, tuple):
-        observer, event_handler = observer_and_handler
-        # Stop periodic scanning first
-        event_handler.stop_scanning()
-        # Stop watchdog observer
-        observer.stop()
-        observer.join()
-    else:
-        # Backward compatibility
-        observer = observer_and_handler
-        observer.stop()
-        observer.join()
-    print("File watcher stopped")
+    """Stop the optimized file watcher"""
+    try:
+        if isinstance(observer_and_handler, tuple):
+            observer, event_handler = observer_and_handler
+            # Stop scanning first
+            event_handler.stop_scanning()
+            # Stop observer
+            observer.stop()
+            observer.join(timeout=10)
+        else:
+            # Backward compatibility
+            observer = observer_and_handler
+            observer.stop()
+            observer.join(timeout=10)
+            
+        print("✅ Optimized file watcher stopped successfully")
+        
+    except Exception as e:
+        print(f"❌ Error stopping watcher: {e}")

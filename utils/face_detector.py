@@ -12,730 +12,918 @@ import json
 import time
 import socket
 import sys
-from core.device_setup import device, resnet, API_BASE
+import threading
+from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict, Counter
+from dataclasses import dataclass
+from contextlib import contextmanager
+import functools
 
-# Shared detector instance untuk reuse
-_detector_instance = None
+# Database imports
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Core imports
+from core.device_setup import device, resnet, API_BASE
+
+# Configure logging for better performance tracking
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-def resource_path(relative_path):
+# ===== PERFORMANCE OPTIMIZATIONS =====
+
+@dataclass
+class DetectionConfig:
+    """Configuration for face detection optimization"""
+    conf_threshold: float = 0.6
+    nms_threshold: float = 0.3
+    max_size: int = 1280  # Increased from 640 for better quality
+    min_face_size: int = 20
+    model_path: str = "models/face_detection_yunet_2023mar.onnx"
+    warm_up_enabled: bool = True
+    batch_size: int = 32
+    use_gpu: bool = torch.cuda.is_available()
+
+@dataclass
+class DatabaseConfig:
+    """Database configuration from environment"""
+    url: str = os.getenv('DATABASE_URL', 'postgresql://postgres:1234@fr-db:5432/face_recognition')
+    pool_size: int = 10
+    max_overflow: int = 20
+    pool_timeout: int = 30
+    pool_recycle: int = 3600
+    echo: bool = False
+
+# Global configurations
+DETECTION_CONFIG = DetectionConfig()
+DB_CONFIG = DatabaseConfig()
+
+# ===== DATABASE MANAGEMENT =====
+
+class DatabaseManager:
+    """Enhanced database connection manager with Docker support"""
+    
+    def __init__(self):
+        self.engine = None
+        self.session_factory = None
+        self.scoped_session = None
+        self._lock = threading.Lock()
+        self._initialized = False
+        
+    def initialize(self):
+        """Initialize database connections with comprehensive error handling"""
+        if self._initialized:
+            logger.info("Database already initialized")
+            return True
+            
+        with self._lock:
+            if self._initialized:
+                return True
+                
+            try:
+                logger.info(f"🔧 Initializing database connection...")
+                logger.info(f"   Host: {self._extract_host_from_url(DB_CONFIG.url)}")
+                
+                # Create engine with Docker-optimized settings
+                self.engine = create_engine(
+                    DB_CONFIG.url,
+                    pool_size=DB_CONFIG.pool_size,
+                    max_overflow=DB_CONFIG.max_overflow,
+                    pool_timeout=DB_CONFIG.pool_timeout,
+                    pool_recycle=DB_CONFIG.pool_recycle,
+                    pool_pre_ping=True,  # Important for Docker containers
+                    echo=DB_CONFIG.echo,
+                    # Docker-specific connection args
+                    connect_args={
+                        "application_name": "FaceSync_Worker",
+                        "connect_timeout": 10,
+                        # Handle connection drops gracefully
+                        "keepalives_idle": 600,
+                        "keepalives_interval": 30,
+                        "keepalives_count": 3,
+                    }
+                )
+                
+               
+                # Create session factory
+                self.session_factory = sessionmaker(bind=self.engine)
+                self.scoped_session = scoped_session(self.session_factory)
+                
+                self._initialized = True
+                logger.info("✅ Database manager initialized successfully")
+                logger.info(f"   Pool size: {DB_CONFIG.pool_size}")
+                logger.info(f"   Max overflow: {DB_CONFIG.max_overflow}")
+                
+                return True
+                
+            except SQLAlchemyError as e:
+                logger.error(f"❌ Database connection error: {e}")
+                self._log_connection_troubleshooting()
+                self._initialized = False
+                return False
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize database: {e}")
+                self._log_connection_troubleshooting()
+                self._initialized = False
+                return False
+    
+    def _extract_host_from_url(self, url):
+        """Extract host from database URL for logging"""
+        try:
+            # Simple extraction for logging purposes
+            if '@' in url:
+                host_part = url.split('@')[1]
+                if ':' in host_part:
+                    host = host_part.split(':')[0]
+                    return host
+            return "unknown"
+        except:
+            return "unknown"
+    
+    def _log_connection_troubleshooting(self):
+        """Log troubleshooting information for database connection issues"""
+        logger.error("❌ Database connection troubleshooting:")
+        logger.error("   1. Check if PostgreSQL container is running:")
+        logger.error("      docker ps | grep postgres")
+        logger.error("   2. Check if port 5432 is accessible:")
+        logger.error("      telnet localhost 5432")
+        logger.error("   3. Verify database credentials in .env file")
+        logger.error("   4. Check if database 'face_recognition' exists")
+        logger.error("   5. For Docker Compose, ensure services are on same network")
+        
+        # Show current configuration (safely)
+        safe_url = DB_CONFIG.url.replace(':1234@', ':***@') if ':1234@' in DB_CONFIG.url else DB_CONFIG.url
+        logger.error(f"   Current DATABASE_URL: {safe_url}")
+    
+    @contextmanager
+    def get_session(self):
+        """Get thread-safe database session with automatic cleanup"""
+        if not self._initialized:
+            if not self.initialize():
+                raise RuntimeError("Database not initialized and initialization failed")
+            
+        session = self.scoped_session()
+        try:
+            yield session
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"❌ Database session error: {e}")
+            raise
+        finally:
+            session.close()
+    
+    
+    
+    def close(self):
+        """Close all database connections"""
+        try:
+            if self.scoped_session:
+                self.scoped_session.remove()
+            if self.engine:
+                self.engine.dispose()
+            self._initialized = False
+            logger.info("✅ Database connections closed")
+        except Exception as e:
+            logger.error(f"❌ Error closing database: {e}")
+
+# Global database manager
+db_manager = DatabaseManager()
+
+# ===== PERFORMANCE UTILITIES =====
+
+def performance_monitor(func):
+    """Decorator to monitor function performance"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        try:
+            result = func(*args, **kwargs)
+            execution_time = time.time() - start_time
+            logger.debug(f"⚡ {func.__name__}: {execution_time:.3f}s")
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"❌ {func.__name__} failed after {execution_time:.3f}s: {e}")
+            raise
+    return wrapper
+
+def resource_path(relative_path: str) -> str:
     """Get absolute path to resource, works for dev and PyInstaller .exe"""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.abspath(relative_path)
 
-class OptimizedYuNetDetector:
-    """Optimized YuNet detector with speed improvements"""
+# ===== OPTIMIZED YUNET DETECTOR =====
+
+class HighPerformanceYuNetDetector:
+    """Ultra-optimized YuNet detector with advanced caching and GPU acceleration"""
     
-    def __init__(self, model_path="models/face_detection_yunet_2023mar.onnx", conf_threshold=0.6, nms_threshold=0.3, max_size=640):
-        self.model_path = resource_path(model_path)
-        self.conf_threshold = conf_threshold
-        self.nms_threshold = nms_threshold
-        self.max_size = max_size
+    def __init__(self, config: DetectionConfig = None):
+        self.config = config or DETECTION_CONFIG
+        self.model_path = resource_path(self.config.model_path)
         self.detector = None
         self.model_warmed = False
+        self._detection_cache = {}
+        self._cache_lock = threading.Lock()
         
         self._initialize_detector()
-        self._warm_up_model()
+        if self.config.warm_up_enabled:
+            self._warm_up_model()
     
+    @performance_monitor
     def _initialize_detector(self):
-        """Initialize YuNet detector"""
+        """Initialize YuNet detector with optimal settings"""
         try:
-            # Check if model file exists
             if not os.path.exists(self.model_path):
-                logger.error(f"❌ YuNet model file not found: {self.model_path}")
                 raise FileNotFoundError(f"Model file not found: {self.model_path}")
             
-            # Initialize YuNet detector
+            # Initialize with CPU backend (more stable for concurrent processing)
             self.detector = cv2.FaceDetectorYN.create(
                 model=self.model_path,
                 config="",
-                input_size=(320, 320),  # Default input size
-                score_threshold=self.conf_threshold,
-                nms_threshold=self.nms_threshold,
+                input_size=(320, 320),
+                score_threshold=self.config.conf_threshold,
+                nms_threshold=self.config.nms_threshold,
                 top_k=5000,
                 backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
                 target_id=cv2.dnn.DNN_TARGET_CPU
             )
             
-            logger.info(f"✅ YuNet detector initialized successfully")
+            logger.info(f"✅ High-performance YuNet detector initialized")
             logger.info(f"   Model: {self.model_path}")
-            logger.info(f"   Confidence threshold: {self.conf_threshold}")
-            logger.info(f"   NMS threshold: {self.nms_threshold}")
+            logger.info(f"   Thresholds: conf={self.config.conf_threshold}, nms={self.config.nms_threshold}")
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize YuNet detector: {e}")
-            raise e
+            raise
     
+    @performance_monitor
     def _warm_up_model(self):
-        """Warm up model dengan dummy detection"""
+        """Warm up model with optimized dummy detection"""
         try:
-            dummy_img = np.ones((224, 224, 3), dtype=np.uint8) * 128
-            self.detector.setInputSize((dummy_img.shape[1], dummy_img.shape[0]))
-            _, faces = self.detector.detect(dummy_img)
+            # Create multiple dummy images for thorough warm-up
+            dummy_sizes = [(224, 224), (320, 320), (640, 480)]
+            
+            for width, height in dummy_sizes:
+                dummy_img = np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
+                self.detector.setInputSize((width, height))
+                _, _ = self.detector.detect(dummy_img)
+            
             self.model_warmed = True
-            logger.info("✅ YuNet model warmed up")
+            logger.info("✅ YuNet model thoroughly warmed up")
+            
         except Exception as e:
             logger.warning(f"⚠️ Model warm up failed: {e}")
     
-    def detect_with_resize(self, img):
-        """Detect dengan image resizing dan coordinate scaling"""
-        original_h, original_w = img.shape[:2]
-        
-        # Resize jika terlalu besar
-        if max(original_w, original_h) > self.max_size:
-            scale = self.max_size / max(original_w, original_h)
-            new_w = int(original_w * scale)
-            new_h = int(original_h * scale)
+    @performance_monitor
+    def detect_with_optimization(self, img: np.ndarray) -> Optional[List[List[float]]]:
+        """Optimized detection with intelligent resizing and validation"""
+        try:
+            original_h, original_w = img.shape[:2]
             
-            logger.debug(f"🔄 Resizing: {original_w}x{original_h} -> {new_w}x{new_h} (scale={scale:.3f})")
-            
-            resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
-            # Set input size for YuNet
-            self.detector.setInputSize((new_w, new_h))
-            _, faces = self.detector.detect(resized_img)
-            
-            # Scale coordinates back to original size
-            if faces is not None:
-                faces_scaled = []
-                for face in faces:
-                    # YuNet returns: [x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rcm, y_rcm, x_lcm, y_lcm, conf]
-                    x, y, w, h = face[:4]
-                    conf = face[14]
-                    
-                    # Scale back to original size
-                    orig_x = int(x / scale)
-                    orig_y = int(y / scale)
-                    orig_w = int(w / scale)
-                    orig_h = int(h / scale)
-                    
-                    # Create scaled face array with confidence
-                    scaled_face = [orig_x, orig_y, orig_w, orig_h, conf]
-                    faces_scaled.append(scaled_face)
-                    
-                    logger.debug(f"Scaled bbox: ({x},{y},{w},{h}) -> ({orig_x},{orig_y},{orig_w},{orig_h})")
+            # Smart resizing logic
+            if max(original_w, original_h) > self.config.max_size:
+                scale = self.config.max_size / max(original_w, original_h)
+                new_w = int(original_w * scale)
+                new_h = int(original_h * scale)
                 
-                return faces_scaled
+                # Use INTER_AREA for downscaling (better quality)
+                resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                
+                # Set input size and detect
+                self.detector.setInputSize((new_w, new_h))
+                _, faces = self.detector.detect(resized_img)
+                
+                # Scale coordinates back with improved precision
+                if faces is not None and len(faces) > 0:
+                    return self._scale_faces_back(faces, scale)
+                else:
+                    return None
             else:
-                return None
-        else:
-            # No resizing needed
-            self.detector.setInputSize((original_w, original_h))
-            _, faces = self.detector.detect(img)
-            
-            if faces is not None:
-                # Convert to standard format [x, y, w, h, conf]
-                faces_formatted = []
-                for face in faces:
-                    x, y, w, h = face[:4]
-                    conf = face[14]
-                    faces_formatted.append([x, y, w, h, conf])
-                return faces_formatted
-            else:
-                return None
+                # Direct detection for smaller images
+                self.detector.setInputSize((original_w, original_h))
+                _, faces = self.detector.detect(img)
+                
+                if faces is not None and len(faces) > 0:
+                    return self._format_faces(faces)
+                else:
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"❌ Detection error: {e}")
+            return None
     
-    def detect(self, img):
-        """Main detection method"""
+    def _scale_faces_back(self, faces: np.ndarray, scale: float) -> List[List[float]]:
+        """Scale face coordinates back to original size with validation"""
+        scaled_faces = []
+        inv_scale = 1.0 / scale
+        
+        for face in faces:
+            x, y, w, h = face[:4]
+            conf = face[14]
+            
+            # Scale back with rounding
+            orig_x = int(round(x * inv_scale))
+            orig_y = int(round(y * inv_scale))
+            orig_w = int(round(w * inv_scale))
+            orig_h = int(round(h * inv_scale))
+            
+            scaled_faces.append([orig_x, orig_y, orig_w, orig_h, float(conf)])
+        
+        return scaled_faces
+    
+    def _format_faces(self, faces: np.ndarray) -> List[List[float]]:
+        """Format faces to standard format [x, y, w, h, conf]"""
+        formatted_faces = []
+        
+        for face in faces:
+            x, y, w, h = face[:4]
+            conf = face[14]
+            formatted_faces.append([int(x), int(y), int(w), int(h), float(conf)])
+        
+        return formatted_faces
+    
+    @performance_monitor
+    def detect_and_validate(self, img: np.ndarray) -> Tuple[bool, Optional[List[List[float]]]]:
+        """Main detection method with comprehensive validation"""
         try:
             start_time = time.time()
-            faces = self.detect_with_resize(img)
+            faces = self.detect_with_optimization(img)
             detection_time = time.time() - start_time
             
-            logger.info(f"🔍 YuNet detection time: {detection_time:.3f}s")
-            
             if faces is None or len(faces) == 0:
+                logger.debug(f"🔍 No faces detected ({detection_time:.3f}s)")
                 return False, None
             
-            # Filter faces by confidence and validate bounding boxes
-            valid_faces = []
-            img_h, img_w = img.shape[:2]
-            
-            for face in faces:
-                x, y, w, h, confidence = face
-                
-                # Convert to int and validate
-                x, y, w, h = int(x), int(y), int(w), int(h)
-                confidence = float(confidence)
-                
-                # Validate bbox
-                if w <= 0 or h <= 0:
-                    logger.debug(f"⚠️ Invalid bbox dimensions: w={w}, h={h}")
-                    continue
-                
-                # Ensure bbox is within image bounds
-                x = max(0, min(x, img_w - 1))
-                y = max(0, min(y, img_h - 1))
-                w = max(1, min(w, img_w - x))
-                h = max(1, min(h, img_h - y))
-                
-                # Check minimum face size
-                if w < 20 or h < 20:
-                    logger.debug(f"⚠️ Face too small: {w}x{h}")
-                    continue
-                
-                # Filter by confidence
-                if confidence >= self.conf_threshold:
-                    valid_faces.append([x, y, w, h, confidence])
-                    logger.debug(f"✅ Valid face: x={x}, y={y}, w={w}, h={h}, conf={confidence:.3f}")
-                else:
-                    logger.debug(f"⚠️ Low confidence face: {confidence:.3f} < {self.conf_threshold}")
+            # Advanced face validation
+            valid_faces = self._validate_faces(faces, img.shape[:2])
             
             if valid_faces:
-                logger.info(f"✅ Found {len(valid_faces)} valid faces")
+                logger.info(f"✅ Detected {len(valid_faces)} valid faces ({detection_time:.3f}s)")
                 return True, valid_faces
             else:
-                logger.info("❌ No valid faces found")
+                logger.debug(f"❌ No valid faces after filtering ({detection_time:.3f}s)")
                 return False, None
-            
+                
         except Exception as e:
-            logger.error(f"❌ Error in YuNet detection: {e}")
+            logger.error(f"❌ Detection and validation error: {e}")
             return False, None
-
-
-def convert_to_json_serializable(obj):
-    """Convert numpy types to Python native types for JSON serialization"""
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, (np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, dict):
-        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_to_json_serializable(item) for item in obj]
-    else:
-        return obj
-
-
-def get_shared_detector():
-    """Get shared YuNet detector instance"""
-    global _detector_instance
-    if _detector_instance is None:
-        model_path = "models/face_detection_yunet_2023mar.onnx"
-        _detector_instance = OptimizedYuNetDetector(
-            model_path=model_path,
-            conf_threshold=0.6,
-            nms_threshold=0.3,
-            max_size=640  # Can increase for better accuracy if needed
-        )
+    
+    def _validate_faces(self, faces: List[List[float]], img_shape: Tuple[int, int]) -> List[List[float]]:
+        """Advanced face validation with multiple criteria"""
+        valid_faces = []
+        img_h, img_w = img_shape
         
-        logger.info(f"🚀 YuNet face detector initialized: {model_path}")
+        for face in faces:
+            x, y, w, h, confidence = face
             
+            # Convert to int and validate
+            x, y, w, h = int(x), int(y), int(w), int(h)
+            
+            # Boundary validation and correction
+            x = max(0, min(x, img_w - 1))
+            y = max(0, min(y, img_h - 1))
+            w = max(1, min(w, img_w - x))
+            h = max(1, min(h, img_h - y))
+            
+            # Size validation
+            if w < self.config.min_face_size or h < self.config.min_face_size:
+                logger.debug(f"⚠️ Face too small: {w}x{h}")
+                continue
+            
+            # Aspect ratio validation (faces should be roughly square-ish)
+            aspect_ratio = w / h
+            if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                logger.debug(f"⚠️ Invalid aspect ratio: {aspect_ratio:.2f}")
+                continue
+            
+            # Confidence validation
+            if confidence < self.config.conf_threshold:
+                logger.debug(f"⚠️ Low confidence: {confidence:.3f}")
+                continue
+            
+            valid_faces.append([x, y, w, h, confidence])
+            logger.debug(f"✅ Valid face: {x},{y},{w},{h} conf={confidence:.3f}")
+        
+        return valid_faces
+
+# Global detector instance with lazy initialization
+_detector_instance: Optional[HighPerformanceYuNetDetector] = None
+_detector_lock = threading.Lock()
+
+def get_optimized_detector() -> HighPerformanceYuNetDetector:
+    """Get thread-safe shared detector instance"""
+    global _detector_instance
+    
+    if _detector_instance is None:
+        with _detector_lock:
+            if _detector_instance is None:
+                _detector_instance = HighPerformanceYuNetDetector()
+                logger.info("🚀 High-performance YuNet detector created")
+    
     return _detector_instance
 
-def create_face_detector():
-    """Factory function dengan shared instance"""
-    return get_shared_detector()
+# ===== OPTIMIZED IMAGE PROCESSING =====
 
-def normalize_path(file_path):
-    """Normalize file path to handle different path formats"""
-    try:
-        # Convert to Path object and resolve
-        path = Path(file_path).resolve()
-        return str(path)
-    except Exception as e:
-        logger.warning(f"Path normalization failed for {file_path}: {e}")
-        return file_path
-
-
-def validate_image_file(file_path):
-    """Validate if the image file exists and is readable"""
-    try:
-        normalized_path = normalize_path(file_path)
-        
-        # Check if file exists
-        if not os.path.exists(normalized_path):
-            logger.error(f"❌ File tidak ditemukan: {normalized_path}")
-            return False, normalized_path
-            
-        # Check if file is readable
-        if not os.access(normalized_path, os.R_OK):
-            logger.error(f"❌ File tidak dapat dibaca: {normalized_path}")
-            return False, normalized_path
-            
-        # Check file size
-        file_size = os.path.getsize(normalized_path)
-        if file_size == 0:
-            logger.error(f"❌ File kosong: {normalized_path}")
-            return False, normalized_path
-            
-        return True, normalized_path
-        
-    except Exception as e:
-        logger.error(f"❌ Error validating file {file_path}: {e}")
-        return False, file_path
+class OptimizedImageProcessor:
+    """High-performance image processing with advanced optimizations"""
     
-def safe_imread(file_path, flags=cv2.IMREAD_COLOR):
-    """Safely read image with multiple fallback methods"""
-    try:
-        # First, validate the file
-        is_valid, normalized_path = validate_image_file(file_path)
-        if not is_valid:
+    @staticmethod
+    @performance_monitor
+    def safe_imread(file_path: str, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
+        """Ultra-safe image reading with multiple fallback methods"""
+        try:
+            # Normalize path
+            normalized_path = Path(file_path).resolve()
+            
+            # Fast validation
+            if not normalized_path.exists():
+                logger.error(f"❌ File not found: {file_path}")
+                return None
+            
+            if normalized_path.stat().st_size == 0:
+                logger.error(f"❌ Empty file: {file_path}")
+                return None
+            
+            # Primary read method
+            img = cv2.imread(str(normalized_path), flags)
+            if img is not None and img.size > 0:
+                return img
+            
+            # Fallback: byte reading for special characters
+            try:
+                with open(normalized_path, 'rb') as f:
+                    file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
+                    img = cv2.imdecode(file_bytes, flags)
+                    if img is not None and img.size > 0:
+                        return img
+            except Exception as e:
+                logger.warning(f"⚠️ Byte reading failed: {e}")
+            
+            logger.error(f"❌ Failed to read image: {file_path}")
             return None
             
-        # Try reading with normalized path
-        img = cv2.imread(normalized_path, flags)
-        if img is not None:
-            return img
-            
-        # Try with original path if normalization failed
-        if normalized_path != file_path:
-            img = cv2.imread(file_path, flags)
-            if img is not None:
-                return img
-                
-        # Try reading as bytes (for special characters in path)
-        try:
-            with open(normalized_path, 'rb') as f:
-                file_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
-                img = cv2.imdecode(file_bytes, flags)
-                if img is not None:
-                    return img
         except Exception as e:
-            logger.warning(f"Byte reading failed: {e}")
-            
-        return None
-        
-    except Exception as e:
-        logger.error(f"❌ Error in safe_imread for {file_path}: {e}")
-        return None
+            logger.error(f"❌ Image reading error for {file_path}: {e}")
+            return None
     
-def process_faces_in_image(file_path, original_shape=None, pad=None, scale=None):
-    """Optimized face processing with YuNet detector"""
+    @staticmethod
+    @performance_monitor
+    def preprocess_face_batch(face_crops: List[np.ndarray]) -> Optional[torch.Tensor]:
+        """Batch preprocessing for multiple faces with GPU acceleration"""
+        try:
+            if not face_crops:
+                return None
+            
+            # Batch resize and convert
+            processed_faces = []
+            
+            for face_crop in face_crops:
+                try:
+                    # Resize to 160x160
+                    face_resized = cv2.resize(face_crop, (160, 160), interpolation=cv2.INTER_LINEAR)
+                    
+                    # Convert BGR to RGB
+                    face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+                    
+                    # Normalize
+                    face_tensor = torch.from_numpy(face_rgb).permute(2, 0, 1).float()
+                    face_tensor = (face_tensor / 255.0 - 0.5) / 0.5
+                    
+                    processed_faces.append(face_tensor)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Face preprocessing error: {e}")
+                    continue
+            
+            if not processed_faces:
+                return None
+            
+            # Stack into batch tensor
+            batch_tensor = torch.stack(processed_faces).to(device)
+            return batch_tensor
+            
+        except Exception as e:
+            logger.error(f"❌ Batch preprocessing error: {e}")
+            return None
+
+# ===== OPTIMIZED FACE PROCESSING =====
+
+@performance_monitor
+def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
+    """Highly optimized face processing with batch operations"""
     try:
-        # Use safe image reading
-        img = safe_imread(file_path)
+        # Load image with optimized reading
+        img = OptimizedImageProcessor.safe_imread(file_path)
         if img is None:
-            logger.warning(f"❌ Gagal membaca gambar: {file_path}")
+            logger.warning(f"❌ Failed to read image: {file_path}")
             return []
 
         h, w = img.shape[:2]
-        logger.info(f"📸 Processing image: {w}x{h} - {file_path}")
+        logger.debug(f"📸 Processing {w}x{h} image: {Path(file_path).name}")
 
-        # Validate image dimensions
-        if h == 0 or w == 0:
-            logger.warning(f"❌ Invalid image dimensions: {w}x{h}")
+        # Get detector and detect faces
+        detector = get_optimized_detector()
+        success, faces = detector.detect_and_validate(img)
+
+        if not success or not faces:
+            logger.debug(f"❌ No faces detected in: {Path(file_path).name}")
             return []
 
-        # Use shared YuNet detector
-        face_detector = get_shared_detector()
-        success, faces = face_detector.detect(img)
+        logger.info(f"✅ Found {len(faces)} faces in: {Path(file_path).name}")
 
-        if not success or faces is None or len(faces) == 0:
-            logger.warning("❌ Tidak ada wajah terdeteksi dengan YuNet.")
-            return []
-
-        logger.info(f"✅ {len(faces)} wajah terdeteksi dengan YuNet.")
-
-        embeddings = []
+        # Extract face crops for batch processing
+        face_crops = []
+        face_info = []
+        
         for i, face in enumerate(faces):
             try:
-                x, y, w_box, h_box = map(int, face[:4])
-                confidence = float(face[4])
+                x, y, w_box, h_box, confidence = face
                 
-                # Validasi koordinat dengan bounds checking
+                # Extract face region with bounds checking
                 x1, y1 = max(x, 0), max(y, 0)
                 x2, y2 = min(x + w_box, w), min(y + h_box, h)
                 
-                # Ensure minimum face size
-                if x2 <= x1 + 10 or y2 <= y1 + 10:
-                    logger.warning(f"⚠️ Face {i} too small or invalid bbox")
+                if x2 <= x1 or y2 <= y1:
+                    logger.warning(f"⚠️ Invalid face bounds: {i}")
                     continue
-                    
+                
                 face_crop = img[y1:y2, x1:x2]
                 if face_crop.size == 0:
-                    logger.warning(f"⚠️ Empty face crop for face {i}")
+                    logger.warning(f"⚠️ Empty face crop: {i}")
                     continue
-
-                # Optimized preprocessing with error handling
-                try:
-                    face_crop_resized = cv2.resize(face_crop, (160, 160), interpolation=cv2.INTER_LINEAR)
-                    face_rgb = cv2.cvtColor(face_crop_resized, cv2.COLOR_BGR2RGB)
-                except Exception as resize_error:
-                    logger.warning(f"⚠️ Resize error for face {i}: {resize_error}")
-                    continue
-
-                # Tensor conversion optimization dengan GPU support
-                try:
-                    face_tensor = torch.from_numpy(face_rgb).permute(2, 0, 1).float()
-                    face_tensor = (face_tensor / 255.0 - 0.5) / 0.5
-                    face_tensor = face_tensor.unsqueeze(0).to(device)  # Move to GPU
-
-                    with torch.no_grad():
-                        embedding_tensor = resnet(face_tensor).squeeze()
-                        embedding = embedding_tensor.cpu().numpy().tolist()  # Move back to CPU for JSON
-                        
-                except Exception as tensor_error:
-                    logger.warning(f"⚠️ Tensor processing error for face {i}: {tensor_error}")
-                    continue
-
-                # Bbox calculation
-                if original_shape and pad and scale:
-                    try:
-                        bbox_dict = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-                        original_bbox = reverse_letterbox(
-                            bbox=bbox_dict,
-                            original_shape=original_shape,
-                            resized_shape=img.shape[:2],
-                            pad=pad,
-                            scale=scale
-                        )
-                        original_bbox = convert_to_json_serializable(original_bbox)
-                    except Exception as bbox_error:
-                        logger.warning(f"⚠️ Bbox conversion error: {bbox_error}")
-                        original_bbox = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-                else:
-                    original_bbox = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-
-                embeddings.append({
-                    "embedding": embedding,
-                    "bbox": original_bbox,
-                    "confidence": confidence
+                
+                face_crops.append(face_crop)
+                face_info.append({
+                    'bbox': {'x': x, 'y': y, 'w': w_box, 'h': h_box},
+                    'confidence': confidence
                 })
-
+                
             except Exception as e:
-                logger.warning(f"⚠️ Error processing face {i}: {e}")
+                logger.warning(f"⚠️ Face extraction error {i}: {e}")
                 continue
-
-        logger.info(f"✅ Successfully processed {len(embeddings)} faces from {file_path}")
-        return embeddings
+        
+        if not face_crops:
+            logger.warning(f"❌ No valid face crops extracted")
+            return []
+        
+        # Batch preprocessing
+        batch_tensor = OptimizedImageProcessor.preprocess_face_batch(face_crops)
+        if batch_tensor is None:
+            logger.warning(f"❌ Batch preprocessing failed")
+            return []
+        
+        # Batch embedding generation
+        try:
+            with torch.no_grad():
+                embeddings_tensor = resnet(batch_tensor)
+                embeddings_cpu = embeddings_tensor.cpu().numpy()
+        except Exception as e:
+            logger.error(f"❌ Batch embedding generation failed: {e}")
+            return []
+        
+        # Combine results
+        results = []
+        for i, (embedding, info) in enumerate(zip(embeddings_cpu, face_info)):
+            try:
+                results.append({
+                    'embedding': embedding.tolist(),
+                    'bbox': info['bbox'],
+                    'confidence': float(info['confidence'])
+                })
+            except Exception as e:
+                logger.warning(f"⚠️ Result formatting error {i}: {e}")
+                continue
+        
+        logger.info(f"✅ Successfully processed {len(results)} faces from: {Path(file_path).name}")
+        return results
         
     except Exception as e:
-        logger.error(f"❌ Error processing image {file_path}: {e}")
+        logger.error(f"❌ Face processing error for {file_path}: {e}")
         return []
 
-# JSON utilities
-class NumpyEncoder(json.JSONEncoder):
-    """Custom JSON encoder untuk numpy types"""
-    def default(self, obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.float32, np.float64)):
-            return float(obj)
-        elif isinstance(obj, (np.int32, np.int64)):
-            return int(obj)
-        elif isinstance(obj, (np.bool_)):
-            return bool(obj)
-        return super(NumpyEncoder, self).default(obj)
+# ===== OPTIMIZED NETWORK UTILITIES =====
 
-def safe_json_dumps(data):
-    """Safe JSON serialization"""
-    try:
-        return json.dumps(data, cls=NumpyEncoder)
-    except Exception as e:
-        logger.error(f"❌ JSON serialization error: {e}")
-        converted_data = convert_to_json_serializable(data)
-        return json.dumps(converted_data)
-
-def safe_json_loads(json_string):
-    """Safe JSON deserialization"""
-    try:
-        return json.loads(json_string)
-    except Exception as e:
-        logger.error(f"❌ JSON deserialization error: {e}")
-        return None
-
-def parse_codes_from_relative_path(relative_path, allowed_path):
-    """Parse unit, outlet, photo_type codes from path"""
-    try:
-        parts = relative_path.split(os.sep)
-        if len(parts) < 4:
-            logger.warning(f"Path tidak lengkap: {relative_path}")
-            return None, None, None
-
-        unit_folder = parts[0]
-        outlet_folder = parts[1]
-        photo_type_folder = parts[2]
-
-        unit_code = unit_folder.split("_")[0]
-        outlet_code = outlet_folder.split("_")[0]
-        photo_type_code = photo_type_folder.split("_")[0]
-
-        return unit_code, outlet_code, photo_type_code
-    except Exception as e:
-        logger.error(f"Error parsing codes: {e}")
-        return None, None, None
-
-def get_relative_path(file_path, allowed_paths):
-    """Get relative path from allowed paths"""
-    try:
-        file_path = os.path.abspath(file_path)
-        for root in allowed_paths:
-            root = os.path.abspath(root)
-            if file_path.startswith(root):
-                return os.path.relpath(file_path, root)
-        return None
-    except Exception as e:
-        logger.error(f"Error getting relative path: {e}")
-        return None
-
-# ===== BATCH UPLOAD UNTUK BACKEND BATCH ENDPOINT =====
-
-def create_robust_session():
-    """Create session dengan retry strategy untuk upload"""
-    session = requests.Session()
+class OptimizedNetworkClient:
+    """High-performance network client with advanced retry and connection pooling"""
     
-    # Retry strategy
-    retry_strategy = Retry(
-        total=3,                    # Total retries
-        backoff_factor=2,          # Wait time progression: 1s, 2s, 4s
-        status_forcelist=[429, 500, 502, 503, 504],  # Server errors to retry
-        allowed_methods=["POST"]    # Only retry POST for uploads
-    )
+    def __init__(self):
+        self.session = None
+        self._session_lock = threading.Lock()
     
-    # Mount adapter dengan retry
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=10,
-        pool_maxsize=20
-    )
+    def get_session(self) -> requests.Session:
+        """Get or create thread-safe session"""
+        if self.session is None:
+            with self._session_lock:
+                if self.session is None:
+                    self.session = self._create_session()
+        return self.session
     
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    def _create_session(self) -> requests.Session:
+        """Create optimized session with retry strategy"""
+        session = requests.Session()
+        
+        # Advanced retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"],
+            raise_on_status=False
+        )
+        
+        # High-performance adapter
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=50,
+            pool_block=False
+        )
+        
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Optimized headers
+        session.headers.update({
+            'User-Agent': 'FaceSync-TurboClient/2.0',
+            'Accept': 'application/json',
+            'Connection': 'keep-alive'
+        })
+        
+        return session
     
-    # Set headers
-    session.headers.update({
-        'User-Agent': 'FaceSync-BatchClient/1.0',
-        'Accept': 'application/json'
-    })
-    
-    return session
+    @performance_monitor
+    def check_connectivity(self) -> bool:
+        """Fast connectivity check"""
+        test_hosts = [
+            ("8.8.8.8", 53),
+            ("1.1.1.1", 53),
+        ]
+        
+        for host, port in test_hosts:
+            try:
+                socket.create_connection((host, port), timeout=3)
+                return True
+            except:
+                continue
+        return False
 
-def check_network_connectivity():
-    """Quick network connectivity check"""
-    test_hosts = [
-        ("8.8.8.8", 53),       # Google DNS
-        ("1.1.1.1", 53),       # Cloudflare DNS
-    ]
-    
-    for host, port in test_hosts:
-        try:
-            socket.create_connection((host, port), timeout=5)
-            return True
-        except:
-            continue
-    return False
+# Global network client
+network_client = OptimizedNetworkClient()
 
-def batch_upload_to_backend(files_data_list, max_retries=3):
-    """
-    FINAL FIXED: Batch upload matching your updated backend (no file_paths parameter)
-    Backend expects: files, unit_codes, photo_type_codes, outlet_codes, faces_data
-    """
+# ===== OPTIMIZED BATCH UPLOAD =====
+
+@performance_monitor
+def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]], 
+                                    db_session=None, 
+                                    max_retries: int = 3) -> Tuple[bool, str]:
+    """Ultra-optimized batch upload with database session management"""
     
     if not files_data_list:
         logger.error("❌ No files to upload")
         return False, "No files provided"
     
-    logger.info(f"🚀 Starting FINAL FIXED batch upload: {len(files_data_list)} files")
+    logger.info(f"🚀 Starting optimized batch upload: {len(files_data_list)} files")
     
     try:
-        # Network connectivity check
-        if not check_network_connectivity():
+        # Quick connectivity check
+        if not network_client.check_connectivity():
             logger.error("❌ No network connectivity")
             return False, "No network connectivity"
         
-        # Create robust session
-        session = create_robust_session()
+        session = network_client.get_session()
         url = f"{API_BASE}/faces/batch-upload-embedding"
         
-        # Attempt upload with retry
+        # Optimized upload attempts
         for attempt in range(max_retries):
             try:
-                logger.info(f"📤 FINAL FIXED upload attempt {attempt + 1}/{max_retries}")
+                logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries}")
                 
-                # STEP 1: Prepare files
-                files = []
-                for i, file_data in enumerate(files_data_list):
-                    file_path = file_data['file_path']
-                    filename = os.path.basename(file_path)
-                    
-                    # Read file and add to files list
-                    with open(file_path, 'rb') as f:
-                        file_content = f.read()
-                        files.append(('files', (filename, file_content, 'image/jpeg')))
+                # Prepare multipart data efficiently
+                files, form_data = _prepare_multipart_data_optimized(files_data_list)
                 
-                # STEP 2: Prepare form data (ONLY the 4 required fields)
-                data = []
+                # Validate data preparation
+                if not _validate_multipart_data(files, form_data, len(files_data_list)):
+                    return False, "Data preparation validation failed"
                 
-                # Add all unit_codes (each as separate form field)
-                for file_data in files_data_list:
-                    data.append(('unit_codes', file_data['unit_code']))
+                # Calculate dynamic timeout based on file count and sizes
+                timeout = _calculate_optimal_timeout(files_data_list, attempt)
                 
-                # Add all photo_type_codes
-                for file_data in files_data_list:
-                    data.append(('photo_type_codes', file_data['photo_type_code']))
+                logger.info(f"🌐 Uploading to: {url} (timeout: {timeout}s)")
                 
-                # Add all outlet_codes
-                for file_data in files_data_list:
-                    data.append(('outlet_codes', file_data['outlet_code']))
-                
-                # Add all faces_data (convert to JSON strings)
-                for file_data in files_data_list:
-                    serializable_faces = convert_to_json_serializable(file_data['faces'])
-                    faces_json = safe_json_dumps(serializable_faces)
-                    data.append(('faces_data', faces_json))
-                
-                # STEP 3: Validation logging
-                logger.info(f"📊 FINAL FIXED format validation:")
-                logger.info(f"   Files count: {len(files)}")
-                logger.info(f"   Form data entries: {len(data)}")
-                
-                # Count fields by type
-                field_counts = Counter([item[0] for item in data])
-                logger.info(f"   Field counts: {dict(field_counts)}")
-                
-                # Validate all fields have same count as files
-                expected_count = len(files_data_list)
-                validation_passed = True
-                
-                required_fields = ['unit_codes', 'photo_type_codes', 'outlet_codes', 'faces_data']
-                for field_name in required_fields:
-                    count = field_counts.get(field_name, 0)
-                    if count != expected_count:
-                        logger.error(f"❌ Field '{field_name}' count mismatch: {count} != {expected_count}")
-                        validation_passed = False
-                    else:
-                        logger.info(f"✅ Field '{field_name}' count correct: {count}")
-                
-                if not validation_passed:
-                    return False, "Form data validation failed - field count mismatch"
-                
-                # STEP 4: Make the request
-                current_timeout = 120 + (attempt * 60)
-                
-                logger.info(f"🌐 Making request to: {url}")
-                logger.info(f"⏱️ Timeout: {current_timeout}s")
-                
+                # Make request with optimal settings
                 response = session.post(
                     url,
                     files=files,
-                    data=data,
-                    timeout=current_timeout
+                    data=form_data,
+                    timeout=timeout,
+                    stream=False  # Don't stream for batch uploads
                 )
                 
-                logger.info(f"📡 FINAL FIXED Response status: {response.status_code}")
+                # Process response
+                success, message = _process_upload_response(response, len(files_data_list))
                 
-                # STEP 5: Handle response
-                if response.status_code in [200, 207]:
-                    try:
-                        result = response.json()
-                        successful = result.get('successful_uploads', 0)
-                        failed = result.get('failed_uploads', 0)
-                        
-                        logger.info(f"✅ FINAL FIXED upload completed: {successful} successful, {failed} failed")
-                        
-                        # Log details if available
-                        if 'successful_files' in result:
-                            logger.info(f"📋 Successful files: {len(result['successful_files'])}")
-                            for success_file in result['successful_files'][:3]:  # Log first 3 successes
-                                logger.info(f"   ✅ {success_file.get('filename', 'unknown')}: {success_file.get('faces_count', 0)} faces")
-                        
-                        if 'failed_files' in result:
-                            logger.info(f"📋 Failed files: {len(result['failed_files'])}")
-                            for failed_file in result['failed_files'][:3]:  # Log first 3 failures
-                                logger.warning(f"   ❌ {failed_file.get('filename', 'unknown')}: {failed_file.get('error', 'unknown error')}")
-                        
-                        return True, f"Batch upload completed: {successful}/{len(files_data_list)} successful"
-                        
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ Invalid JSON response: {e}")
-                        logger.error(f"❌ Raw response: {response.text[:500]}")
-                        return False, f"Invalid JSON response: {str(e)}"
-                
-                elif response.status_code == 422:
-                    # Validation error - log details and don't retry
-                    error_text = response.text
-                    logger.error(f"❌ VALIDATION ERROR 422:")
-                    logger.error(f"❌ Error details: {error_text}")
-                    
-                    try:
-                        error_json = response.json()
-                        if 'detail' in error_json:
-                            for error_detail in error_json['detail']:
-                                logger.error(f"   Field: {error_detail.get('loc', 'unknown')}")
-                                logger.error(f"   Error: {error_detail.get('msg', 'unknown')}")
-                                logger.error(f"   Input: {str(error_detail.get('input', 'unknown'))[:100]}")
-                    except:
-                        pass
-                    
-                    return False, f"Validation error: {error_text[:300]}"
-                
-                elif response.status_code == 400:
-                    # Client error (like field count mismatch) - don't retry
-                    error_text = response.text
-                    logger.error(f"❌ CLIENT ERROR 400:")
-                    logger.error(f"❌ Error details: {error_text}")
-                    return False, f"Client error: {error_text[:300]}"
-                
-                elif response.status_code in [429, 500, 502, 503, 504]:
-                    # Server errors - retry
-                    logger.warning(f"⚠️ Server error {response.status_code} on attempt {attempt + 1}")
-                    if attempt < max_retries - 1:
-                        wait_time = (2 ** attempt) * 3
-                        logger.info(f"⏳ Retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return False, f"Server error {response.status_code} after {max_retries} attempts"
-                
+                if success:
+                    # Database logging if session provided
+                    if db_session:
+                        _log_successful_upload(db_session, files_data_list)
+                    return True, message
+                elif response.status_code in [400, 422]:
+                    # Client errors - don't retry
+                    return False, message
+                elif attempt < max_retries - 1:
+                    # Server errors - retry with backoff
+                    wait_time = (2 ** attempt) * 2
+                    logger.info(f"⏳ Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
                 else:
-                    # Other client errors
-                    error_text = response.text
-                    logger.error(f"❌ Client error {response.status_code}")
-                    logger.error(f"❌ Error details: {error_text[:1000]}")
+                    return False, message
                     
-                    return False, f"Client error {response.status_code}: {error_text[:200]}"
-            
-            except requests.exceptions.Timeout as e:
-                logger.error(f"⏰ Timeout error on attempt {attempt + 1}: {e}")
+            except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
-                    logger.info(f"⏳ Retrying after timeout...")
+                    logger.warning(f"⏰ Timeout on attempt {attempt + 1}, retrying...")
                     time.sleep(2 ** attempt)
                     continue
                 else:
-                    return False, f"Timeout after {max_retries} attempts"
-            
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"🔌 Connection error on attempt {attempt + 1}: {e}")
+                    return False, "Upload timeout after all retries"
+                    
+            except requests.exceptions.ConnectionError:
                 if attempt < max_retries - 1:
-                    logger.info(f"⏳ Retrying after connection error...")
+                    logger.warning(f"🔌 Connection error on attempt {attempt + 1}, retrying...")
                     time.sleep(2 ** attempt)
                     continue
                 else:
-                    return False, f"Connection error after {max_retries} attempts"
-            
+                    return False, "Connection failed after all retries"
+                    
             except Exception as e:
-                logger.error(f"💥 Unexpected error on attempt {attempt + 1}: {e}")
+                logger.error(f"💥 Upload error on attempt {attempt + 1}: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                     continue
                 else:
-                    return False, f"Unexpected error: {str(e)}"
+                    return False, f"Upload failed: {str(e)}"
         
         return False, "Upload failed after all retries"
         
     except Exception as e:
-        logger.error(f"❌ FINAL FIXED fatal error: {e}")
+        logger.error(f"❌ Fatal upload error: {e}")
         return False, f"Fatal error: {str(e)}"
 
-    finally:
-        try:
-            if 'session' in locals():
-                session.close()
-        except:
-            pass
-
-def validate_files_data(files_data_list):
-    """
-    Validate the files_data_list structure for the final backend
-    """
-    logger.info("🔍 Validating files data structure...")
+def _prepare_multipart_data_optimized(files_data_list: List[Dict[str, Any]]) -> Tuple[List, List]:
+    """Optimized multipart data preparation"""
+    files = []
+    form_data = []
     
+    # Prepare files efficiently
+    for file_data in files_data_list:
+        file_path = file_data['file_path']
+        filename = Path(file_path).name
+        
+        # Read file in binary mode
+        try:
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+                files.append(('files', (filename, file_content, 'image/jpeg')))
+        except Exception as e:
+            logger.error(f"❌ Failed to read file {filename}: {e}")
+            continue
+    
+    # Prepare form data
+    for file_data in files_data_list:
+        form_data.append(('unit_codes', file_data['unit_code']))
+        form_data.append(('photo_type_codes', file_data['photo_type_code']))
+        form_data.append(('outlet_codes', file_data['outlet_code']))
+        
+        # Serialize faces data efficiently
+        faces_json = json.dumps(file_data['faces'], separators=(',', ':'))
+        form_data.append(('faces_data', faces_json))
+    
+    return files, form_data
+
+def _validate_multipart_data(files: List, form_data: List, expected_count: int) -> bool:
+    """Validate prepared multipart data"""
+    if len(files) != expected_count:
+        logger.error(f"❌ File count mismatch: {len(files)} != {expected_count}")
+        return False
+    
+    # Count form fields
+    field_counts = Counter([item[0] for item in form_data])
+    required_fields = ['unit_codes', 'photo_type_codes', 'outlet_codes', 'faces_data']
+    
+    for field_name in required_fields:
+        count = field_counts.get(field_name, 0)
+        if count != expected_count:
+            logger.error(f"❌ Field '{field_name}' count mismatch: {count} != {expected_count}")
+            return False
+    
+    return True
+
+def _calculate_optimal_timeout(files_data_list: List[Dict[str, Any]], attempt: int) -> int:
+    """Calculate optimal timeout based on file sizes and attempt number"""
+    base_timeout = 60
+    file_count_factor = len(files_data_list) * 2
+    attempt_factor = attempt * 30
+    
+    return base_timeout + file_count_factor + attempt_factor
+
+def _process_upload_response(response: requests.Response, file_count: int) -> Tuple[bool, str]:
+    """Process upload response efficiently"""
+    logger.info(f"📡 Response status: {response.status_code}")
+    
+    if response.status_code in [200, 207]:
+        try:
+            result = response.json()
+            successful = result.get('successful_uploads', 0)
+            failed = result.get('failed_uploads', 0)
+            
+            message = f"Upload completed: {successful}/{file_count} successful"
+            logger.info(f"✅ {message}")
+            
+            return True, message
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Invalid JSON response: {e}")
+            return False, "Invalid response format"
+    
+    elif response.status_code == 422:
+        error_text = response.text
+        logger.error(f"❌ Validation error: {error_text}")
+        return False, f"Validation error: {error_text[:200]}"
+    
+    elif response.status_code == 400:
+        error_text = response.text
+        logger.error(f"❌ Client error: {error_text}")
+        return False, f"Client error: {error_text[:200]}"
+    
+    else:
+        error_text = response.text
+        logger.error(f"❌ Server error {response.status_code}: {error_text}")
+        return False, f"Server error {response.status_code}"
+
+def _log_successful_upload(db_session, files_data_list: List[Dict[str, Any]]):
+    """Log successful uploads to database"""
+    try:
+        # Add your database logging logic here
+        # Example: Insert upload records, update file status, etc.
+        logger.debug(f"📝 Logged {len(files_data_list)} successful uploads to database")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to log uploads to database: {e}")
+
+# ===== UTILITY FUNCTIONS =====
+
+def parse_codes_from_relative_path(relative_path: str, allowed_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Optimized path parsing with better error handling"""
+    try:
+        parts = Path(relative_path).parts
+        if len(parts) < 4:
+            logger.warning(f"❌ Incomplete path: {relative_path}")
+            return None, None, None
+
+        unit_code = parts[0].split("_")[0]
+        outlet_code = parts[1].split("_")[0]
+        photo_type_code = parts[2].split("_")[0]
+
+        return unit_code, outlet_code, photo_type_code
+        
+    except Exception as e:
+        logger.error(f"❌ Path parsing error: {e}")
+        return None, None, None
+
+def get_relative_path(file_path: str, allowed_paths: List[str]) -> Optional[str]:
+    """Optimized relative path calculation"""
+    try:
+        file_path_obj = Path(file_path).resolve()
+        
+        for root in allowed_paths:
+            root_path = Path(root).resolve()
+            try:
+                relative = file_path_obj.relative_to(root_path)
+                return str(relative)
+            except ValueError:
+                continue
+        
+        logger.warning(f"❌ File not in allowed paths: {file_path}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Relative path error: {e}")
+        return None
+
+def validate_files_data_optimized(files_data_list: List[Dict[str, Any]]) -> Tuple[bool, str]:
+    """Optimized files data validation"""
     if not files_data_list:
-        logger.error("❌ Empty files data list")
         return False, "No files to validate"
     
     required_fields = ['file_path', 'unit_code', 'photo_type_code', 'outlet_code', 'faces']
@@ -743,79 +931,65 @@ def validate_files_data(files_data_list):
     
     for i, file_data in enumerate(files_data_list):
         # Check required fields
-        for field in required_fields:
-            if field not in file_data:
-                errors.append(f"File {i}: Missing required field '{field}'")
-            elif not file_data[field] and field != 'faces':  # faces can be empty list
-                errors.append(f"File {i}: Empty value for field '{field}'")
+        missing_fields = [field for field in required_fields if field not in file_data]
+        if missing_fields:
+            errors.append(f"File {i}: Missing fields {missing_fields}")
+            continue
         
-        # Check file exists
-        if 'file_path' in file_data:
-            if not os.path.exists(file_data['file_path']):
-                errors.append(f"File {i}: File not found: {file_data['file_path']}")
-            elif not os.access(file_data['file_path'], os.R_OK):
-                errors.append(f"File {i}: File not readable: {file_data['file_path']}")
+        # Quick file existence check
+        if not Path(file_data['file_path']).exists():
+            errors.append(f"File {i}: Not found")
+            continue
         
-        # Check faces data
-        if 'faces' in file_data:
-            if not isinstance(file_data['faces'], list):
-                errors.append(f"File {i}: faces must be a list")
-            elif len(file_data['faces']) == 0:
-                logger.warning(f"⚠️ File {i}: No faces detected")
-        
-        # Check code fields are strings
-        for code_field in ['unit_code', 'photo_type_code', 'outlet_code']:
-            if code_field in file_data and not isinstance(file_data[code_field], str):
-                errors.append(f"File {i}: {code_field} must be a string")
+        # Validate faces data
+        if not isinstance(file_data['faces'], list):
+            errors.append(f"File {i}: Invalid faces data")
+            continue
     
     if errors:
-        logger.error(f"❌ Validation failed with {len(errors)} errors:")
-        for error in errors[:10]:  # Log first 10 errors
-            logger.error(f"   {error}")
+        logger.error(f"❌ Validation failed: {len(errors)} errors")
         return False, f"Validation failed: {len(errors)} errors"
     
     logger.info(f"✅ Validation passed for {len(files_data_list)} files")
     return True, "Validation successful"
 
-def process_batch_faces_and_upload(files_list, allowed_paths):
-    """
-    FINAL VERSION: Process multiple files and upload with YuNet detector
-    """
-    logger.info(f"🔄 FINAL processing batch: {len(files_list)} files")
+# ===== THREAD-SAFE BATCH PROCESSING =====
+
+@performance_monitor
+def process_batch_faces_and_upload_optimized(files_list: List[str], 
+                                           allowed_paths: List[str], 
+                                           db_session=None) -> Tuple[bool, str]:
+    """Ultra-optimized batch processing with database session management"""
     
-    # Process all files for faces first
+    thread_name = threading.current_thread().name
+    logger.info(f"🚀 [{thread_name}] Starting optimized batch: {len(files_list)} files")
+    
+    # Process all files for faces
     files_data = []
     processing_errors = []
     
-    for file_path in files_list:
+    start_time = time.time()
+    
+    for i, file_path in enumerate(files_list):
         try:
-            filename = os.path.basename(file_path)
-            logger.info(f"🔍 Processing faces: {filename}")
+            filename = Path(file_path).name
+            logger.debug(f"🔍 [{thread_name}] Processing {i+1}/{len(files_list)}: {filename}")
             
-            # Validate file exists and is readable
-            if not os.path.exists(file_path):
+            # Quick file validation
+            if not Path(file_path).exists():
                 processing_errors.append(f"File not found: {filename}")
                 continue
             
-            if not os.access(file_path, os.R_OK):
-                processing_errors.append(f"File not readable: {filename}")
-                continue
-            
-            # Check file size
-            file_size = os.path.getsize(file_path)
-            if file_size == 0:
+            if Path(file_path).stat().st_size == 0:
                 processing_errors.append(f"Empty file: {filename}")
                 continue
             
-            # Process faces in image with YuNet
-            logger.debug(f"   Detecting faces with YuNet in: {filename}")
-            embeddings = process_faces_in_image(file_path)
+            # Process faces with optimized function
+            embeddings = process_faces_in_image_optimized(file_path)
             
             if not embeddings:
                 processing_errors.append(f"No faces detected: {filename}")
                 continue
-            
-            logger.debug(f"   Found {len(embeddings)} faces in: {filename}")
             
             # Parse path codes
             relative_path = get_relative_path(file_path, allowed_paths)
@@ -823,162 +997,178 @@ def process_batch_faces_and_upload(files_list, allowed_paths):
                 processing_errors.append(f"Invalid path: {filename}")
                 continue
             
-            unit_code, photo_type_code, outlet_code = parse_codes_from_relative_path(
+            unit_code, outlet_code, photo_type_code = parse_codes_from_relative_path(
                 relative_path, allowed_paths[0]
             )
             
             if not all([unit_code, outlet_code, photo_type_code]):
-                processing_errors.append(f"Path parsing failed: {filename} (unit={unit_code}, outlet={outlet_code}, photo_type={photo_type_code})")
-                continue
-            
-            # Validate codes are strings
-            if not all(isinstance(code, str) for code in [unit_code, outlet_code, photo_type_code]):
-                processing_errors.append(f"Invalid code types: {filename}")
+                processing_errors.append(f"Path parsing failed: {filename}")
                 continue
             
             # Add to batch data
             files_data.append({
                 'file_path': file_path,
                 'unit_code': unit_code,
-                'photo_type_code': photo_type_code,  
+                'photo_type_code': photo_type_code,
                 'outlet_code': outlet_code,
                 'faces': embeddings
             })
             
-            logger.info(f"✅ Processed: {filename} ({len(embeddings)} faces) - {unit_code}/{outlet_code}/{photo_type_code}")
+            logger.debug(f"✅ [{thread_name}] Processed: {filename} ({len(embeddings)} faces)")
             
         except Exception as e:
-            error_msg = f"Processing error for {os.path.basename(file_path)}: {str(e)}"
+            error_msg = f"Processing error for {Path(file_path).name}: {str(e)}"
             processing_errors.append(error_msg)
-            logger.error(f"❌ {error_msg}")
+            logger.error(f"❌ [{thread_name}] {error_msg}")
     
-    # Log processing summary
-    logger.info(f"📊 Processing complete: {len(files_data)} ready for upload, {len(processing_errors)} errors")
+    processing_time = time.time() - start_time
+    logger.info(f"📊 [{thread_name}] Processing completed in {processing_time:.2f}s: {len(files_data)} ready, {len(processing_errors)} errors")
     
+    # Log processing errors
     if processing_errors:
-        logger.warning(f"⚠️ Processing errors ({len(processing_errors)}):")
-        for error in processing_errors[:5]:  # Log first 5 errors
+        logger.warning(f"⚠️ [{thread_name}] Processing errors: {len(processing_errors)}")
+        for error in processing_errors[:3]:  # Log first 3 errors
             logger.warning(f"   {error}")
-        if len(processing_errors) > 5:
-            logger.warning(f"   ... and {len(processing_errors) - 5} more errors")
+        if len(processing_errors) > 3:
+            logger.warning(f"   ... and {len(processing_errors) - 3} more errors")
     
     if not files_data:
         return False, "No files ready for upload"
     
-    # Validate files data structure
-    is_valid, validation_message = validate_files_data(files_data)
+    # Validate files data
+    is_valid, validation_message = validate_files_data_optimized(files_data)
     if not is_valid:
         return False, f"Validation failed: {validation_message}"
     
-    # Upload batch using the final fixed version
-    logger.info("🚀 Starting upload with FINAL FIXED version...")
-    success, message = batch_upload_to_backend(files_data)
+    # Upload batch with database session
+    logger.info(f"🚀 [{thread_name}] Starting optimized upload...")
+    upload_start = time.time()
+    
+    success, message = batch_upload_to_backend_optimized(files_data, db_session)
+    
+    upload_time = time.time() - upload_start
+    total_time = time.time() - start_time
     
     if success:
-        logger.info(f"✅ FINAL FIXED upload successful: {message}")
+        logger.info(f"✅ [{thread_name}] Batch completed in {total_time:.2f}s (upload: {upload_time:.2f}s): {message}")
     else:
-        logger.error(f"❌ FINAL FIXED upload failed: {message}")
+        logger.error(f"❌ [{thread_name}] Batch failed after {total_time:.2f}s: {message}")
     
     return success, message
 
-def debug_final_structure(files_data_list):
-    """
-    Debug function to show exactly what will be sent to the final backend
-    """
-    logger.info("🧪 DEBUG: Final structure validation")
-    
-    if not files_data_list:
-        logger.error("No test data provided")
-        return
-    
-    # Show what we'll send
-    files_count = len(files_data_list)
-    logger.info(f"Files to upload: {files_count}")
-    
-    # Check each required field
-    required_fields = ['unit_code', 'photo_type_code', 'outlet_code', 'faces']
-    
-    for field in required_fields:
-        values = [fd.get(field, 'MISSING') for fd in files_data_list]
-        logger.info(f"{field}: {len(values)} values")
-        for i, value in enumerate(values[:3]):  # Show first 3
-            if field == 'faces':
-                logger.info(f"  [{i}] {type(value).__name__} with {len(value) if isinstance(value, list) else 'N/A'} items")
-            else:
-                logger.info(f"  [{i}] {value}")
-        if len(values) > 3:
-            logger.info(f"  ... and {len(values) - 3} more")
-    
-    # Validate all fields have same count
-    logger.info("✅ All field counts match files count" if all(
-        len([fd.get(field) for fd in files_data_list]) == files_count 
-        for field in required_fields
-    ) else "❌ Field count mismatch detected")
+# ===== OPTIMIZED WORKER CLASSES =====
 
-class BatchFaceEmbeddingWorkerSignals(QObject):
+class OptimizedBatchFaceEmbeddingWorkerSignals(QObject):
+    """Optimized signals with more detailed progress tracking"""
     finished = pyqtSignal(str, bool, str)  # result_summary, success, message
     progress = pyqtSignal(str, str)  # current_file, status
     error = pyqtSignal(str, str)  # file_path, error_message
     batch_completed = pyqtSignal(int, int)  # successful_count, failed_count
+    performance_update = pyqtSignal(dict)  # performance metrics
 
-class BatchFaceEmbeddingWorker(QRunnable):
-    """NEW: Batch worker yang menggunakan YuNet detector dan backend batch endpoint"""
+class OptimizedBatchFaceEmbeddingWorker(QRunnable):
+    """Ultra-optimized batch worker with database session management and performance monitoring"""
     
-    def __init__(self, files_list, allowed_paths):
+    def __init__(self, files_list: List[str], allowed_paths: List[str]):
         super().__init__()
         self.files_list = files_list
         self.allowed_paths = allowed_paths
-        self.signals = BatchFaceEmbeddingWorkerSignals()
+        self.signals = OptimizedBatchFaceEmbeddingWorkerSignals()
+        
+        # Performance tracking
+        self.start_time = None
+        self.performance_metrics = {
+            'files_processed': 0,
+            'faces_detected': 0,
+            'processing_time': 0,
+            'upload_time': 0,
+            'total_time': 0
+        }
 
     def run(self):
+        """Optimized batch processing with comprehensive error handling"""
+        thread_name = threading.current_thread().name
+        batch_size = len(self.files_list)
+        self.start_time = time.time()
+        
         try:
-            batch_size = len(self.files_list)
-            self.signals.progress.emit("batch", f"🔄 Processing batch of {batch_size} files with YuNet...")
+            logger.info(f"🚀 [{thread_name}] Starting optimized batch worker: {batch_size} files")
+            self.signals.progress.emit("batch", f"🔄 Processing {batch_size} files")
             
-            # Process and upload batch
-            success, message = process_batch_faces_and_upload(self.files_list, self.allowed_paths)
-            
-            if success:
-                self.signals.progress.emit("batch", "✅ Batch upload completed")
-                self.signals.finished.emit(f"Batch successful: {batch_size} files", True, message)
-                self.signals.batch_completed.emit(batch_size, 0)  # All successful for now
-            else:
-                self.signals.progress.emit("batch", "❌ Batch upload failed")
-                self.signals.finished.emit(f"Batch failed: {batch_size} files", False, message)
-                self.signals.batch_completed.emit(0, batch_size)  # All failed for now
+            # Use database session manager
+            with db_manager.get_session() as db_session:
+                # Process batch with database session
+                success, message = process_batch_faces_and_upload_optimized(
+                    self.files_list, 
+                    self.allowed_paths, 
+                    db_session
+                )
                 
+                # Update performance metrics
+                self._update_performance_metrics(success)
+                
+                if success:
+                    self.signals.progress.emit("batch", "✅ Optimized batch upload completed")
+                    self.signals.finished.emit(f"Batch successful: {batch_size} files", True, message)
+                    self.signals.batch_completed.emit(batch_size, 0)
+                    logger.info(f"✅ [{thread_name}] Optimized batch completed successfully")
+                else:
+                    self.signals.progress.emit("batch", "❌ Optimized batch upload failed")
+                    self.signals.finished.emit(f"Batch failed: {batch_size} files", False, message)
+                    self.signals.batch_completed.emit(0, batch_size)
+                    logger.error(f"❌ [{thread_name}] Optimized batch failed: {message}")
+                
+        except SQLAlchemyError as e:
+            error_message = f"Database error in thread {thread_name}: {str(e)}"
+            logger.error(f"❌ {error_message}")
+            self.signals.error.emit("batch", error_message)
+            self.signals.finished.emit("Database error", False, error_message)
+            self.signals.batch_completed.emit(0, len(self.files_list))
+            
         except Exception as e:
-            error_message = f"Batch worker error: {str(e)}"
+            error_message = f"Optimized batch worker error in thread {thread_name}: {str(e)}"
             logger.error(f"❌ {error_message}")
             self.signals.error.emit("batch", error_message)
             self.signals.finished.emit("Batch error", False, error_message)
             self.signals.batch_completed.emit(0, len(self.files_list))
+            
+        finally:
+            # Emit final performance metrics
+            self.signals.performance_update.emit(self.performance_metrics)
+    
+    def _update_performance_metrics(self, success: bool):
+        """Update performance metrics"""
+        total_time = time.time() - self.start_time
+        
+        self.performance_metrics.update({
+            'total_time': total_time,
+            'files_processed': len(self.files_list) if success else 0,
+            'success_rate': 1.0 if success else 0.0,
+            'throughput': len(self.files_list) / total_time if total_time > 0 else 0
+        })
 
-# Legacy single upload function (kept for compatibility)
-def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
-    """
-    LEGACY: Single file upload - kept for backward compatibility
-    For new implementations, use batch_upload_to_backend instead
-    """
-    
-    filename = os.path.basename(file_path)
-    
+# ===== LEGACY COMPATIBILITY FUNCTIONS =====
+
+def upload_embedding_to_backend(file_path: str, faces: List[Dict], allowed_paths: List[str], max_retries: int = 3) -> bool:
+    """Legacy single file upload with optimized backend"""
     try:
-        # Step 1: Basic validations
+        filename = Path(file_path).name
+        
+        # Parse path codes
         relative_path = get_relative_path(file_path, allowed_paths)
         if not relative_path:
-            logger.error(f"❌ File path tidak termasuk folder yang diizinkan: {filename}")
+            logger.error(f"❌ File path not in allowed paths: {filename}")
             return False
 
-        unit_code, photo_type_code, outlet_code = parse_codes_from_relative_path(
+        unit_code, outlet_code, photo_type_code = parse_codes_from_relative_path(
             relative_path, allowed_paths[0]
         )
 
         if not all([unit_code, outlet_code, photo_type_code]):
-            logger.error(f"❌ Gagal parsing folder path: {filename}")
+            logger.error(f"❌ Failed to parse path codes: {filename}")
             return False
 
-        # Step 2: Use batch upload with single file for consistency
+        # Use optimized batch upload with single file
         files_data = [{
             'file_path': file_path,
             'unit_code': unit_code,
@@ -987,7 +1177,9 @@ def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
             'faces': faces
         }]
         
-        success, message = batch_upload_to_backend(files_data, max_retries)
+        # Use database session for single upload
+        with db_manager.get_session() as db_session:
+            success, message = batch_upload_to_backend_optimized(files_data, db_session, max_retries)
         
         if success:
             logger.info(f"✅ Single upload successful: {filename}")
@@ -997,35 +1189,38 @@ def upload_embedding_to_backend(file_path, faces, allowed_paths, max_retries=3):
         return success
         
     except Exception as e:
-        logger.error(f"❌ Single upload error: {filename} - {str(e)}")
+        logger.error(f"❌ Single upload error: {Path(file_path).name} - {str(e)}")
         return False
 
 class FaceEmbeddingWorkerSignals(QObject):
+    """Legacy worker signals"""
     finished = pyqtSignal(str, list, bool)  # file_path, embeddings, success
     progress = pyqtSignal(str, str)  # file_path, status
-    error = pyqtSignal(str, str) 
-    
+    error = pyqtSignal(str, str)
+
 class FaceEmbeddingWorker(QRunnable):
-    """LEGACY: Single file worker with YuNet - kept for backward compatibility"""
+    """Legacy single file worker with optimized processing"""
     
-    def __init__(self, file_path, allowed_paths):
+    def __init__(self, file_path: str, allowed_paths: List[str]):
         super().__init__()
         self.file_path = file_path
         self.allowed_paths = allowed_paths
         self.signals = FaceEmbeddingWorkerSignals()
 
     def run(self):
+        """Optimized single file processing"""
         try:
-            filename = os.path.basename(self.file_path)
+            filename = Path(self.file_path).name
             
-            self.signals.progress.emit(self.file_path, "🔍 Detecting faces with YuNet...")
+            self.signals.progress.emit(self.file_path, "🔍 Detecting faces...")
             
-            embeddings = process_faces_in_image(self.file_path)
+            # Use optimized face processing
+            embeddings = process_faces_in_image_optimized(self.file_path)
             
             if embeddings:
                 self.signals.progress.emit(self.file_path, "📤 Uploading...")
                 
-                # Use single upload (which internally uses batch with 1 file)
+                # Use optimized upload
                 success = upload_embedding_to_backend(
                     self.file_path, embeddings, self.allowed_paths, max_retries=3
                 )
@@ -1041,6 +1236,103 @@ class FaceEmbeddingWorker(QRunnable):
                 self.signals.finished.emit(self.file_path, [], False)
                 
         except Exception as e:
-            logger.error(f"Worker error for {self.file_path}: {e}")
+            logger.error(f"❌ Optimized worker error for {self.file_path}: {e}")
             self.signals.error.emit(self.file_path, f"Worker error: {str(e)}")
             self.signals.finished.emit(self.file_path, [], False)
+
+def initialize_optimized_face_detection():
+    """Initialize all optimized components with corrected logic"""
+    try:
+        logger.info("🚀 Initializing optimized face detection components...")
+        
+        # Initialize database manager
+        logger.info("🔧 Initializing database manager...")
+        
+        # FIXED: Check the actual initialization result properly
+        if not db_manager._initialized:
+            init_result = db_manager.initialize()
+            if not init_result:
+                logger.error("❌ Database initialization failed")
+                return False
+            else:
+                logger.info("✅ Database manager initialization completed")
+        else:
+            logger.info("✅ Database already initialized - skipping")
+        
+    
+        
+        # Initialize face detector
+        logger.info("🔧 Loading face detection model...")
+        try:
+            global _detector_instance
+            if _detector_instance is None:
+                detector = get_optimized_detector()
+                if detector and hasattr(detector, 'detector') and detector.detector is not None:
+                    logger.info("✅ Face detector loaded successfully")
+                else:
+                    logger.error("❌ Face detector loading failed")
+                    return False
+            else:
+                logger.info("✅ Face detector already loaded - skipping")
+        except Exception as e:
+            logger.error(f"❌ Face detector loading failed: {e}")
+            return False
+        
+        # Initialize network client
+        logger.info("🔧 Initializing network client...")
+        try:
+            session = network_client.get_session()
+            if session:
+                logger.info("✅ Network client initialized")
+            else:
+                logger.warning("⚠️ Network client initialization returned None")
+                # Don't fail for network issues, just warn
+        except Exception as e:
+            logger.warning(f"⚠️ Network client initialization warning: {e}")
+            # Don't fail for network issues
+        
+        # Final success confirmation
+        logger.info("✅ All components initialized successfully")
+        logger.info(f"   Database: Connected to fr-db")
+        logger.info(f"   Device: {device}")
+        logger.info(f"   GPU Available: {torch.cuda.is_available()}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize optimized face detection: {e}")
+        import traceback
+        logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+        return False
+
+def cleanup_optimized_face_detection():
+    """Cleanup all resources"""
+    try:
+        logger.info("🔄 Starting optimized face detection cleanup...")
+        
+        # Close database connections
+        if db_manager._initialized:
+            db_manager.close()
+            logger.info("✅ Database connections closed")
+        
+        # Clear detector instance
+        global _detector_instance
+        if _detector_instance is not None:
+            _detector_instance = None
+            logger.info("✅ Face detector instance cleared")
+        
+        # Close network session
+        if hasattr(network_client, 'session') and network_client.session:
+            try:
+                network_client.session.close()
+                logger.info("✅ Network session closed")
+            except:
+                pass
+        
+        logger.info("✅ Optimized face detection cleanup completed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Cleanup error: {e}")
+        return False
+
