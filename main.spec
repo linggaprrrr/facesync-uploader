@@ -47,8 +47,8 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,  # True jika ingin jendela terminal muncul
-    icon='assets/ownize_logo.ico'  # Gunakan file .ico jika tersedia
+    console=True,  
+    icon='assets/ownize_logo.ico'  
 )
 
 coll = COLLECT(

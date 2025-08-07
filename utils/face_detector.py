@@ -1,3 +1,5 @@
+#utils/face_detector.py
+
 import logging
 import cv2
 import os
@@ -25,6 +27,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
 import os
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -44,10 +49,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DetectionConfig:
     """Configuration for face detection optimization"""
-    conf_threshold: float = 0.6
+    conf_threshold: float = 0.7  
     nms_threshold: float = 0.3
-    max_size: int = 1280  # Increased from 640 for better quality
-    min_face_size: int = 20
+    max_size: int = 1280
+    min_face_size: int = 30  
+    max_faces_per_image: int = 50  
     model_path: str = "models/face_detection_yunet_2023mar.onnx"
     warm_up_enabled: bool = True
     batch_size: int = 32
@@ -224,8 +230,43 @@ def resource_path(relative_path: str) -> str:
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.abspath(relative_path)
 
-# ===== OPTIMIZED YUNET DETECTOR =====
 
+class ParallelBatchProcessor:
+    """New class for parallel processing"""
+    
+    def __init__(self, max_workers=4):
+        self.detection_pool = ThreadPoolExecutor(max_workers=max_workers)
+        self.detector = get_optimized_detector()
+        
+    def process_files_parallel(self, files_list):
+        """Process multiple files in parallel"""
+        futures_to_files = {}
+        
+        # Submit all files for parallel processing
+        for file_path in files_list:
+            future = self.detection_pool.submit(
+                process_faces_in_image_optimized, file_path
+            )
+            futures_to_files[future] = file_path
+            
+        # Collect results as they complete
+        results = []
+        for future in as_completed(futures_to_files):
+            file_path = futures_to_files[future]
+            try:
+                embeddings = future.result(timeout=5)
+                if embeddings:
+                    results.append({
+                        'file_path': file_path,
+                        'embeddings': embeddings
+                    })
+            except Exception as e:
+                logger.error(f"Parallel processing error for {file_path}: {e}")
+                
+        return results
+
+
+# ===== OPTIMIZED YUNET DETECTOR =====
 class HighPerformanceYuNetDetector:
     """Ultra-optimized YuNet detector with advanced caching and GPU acceleration"""
     
@@ -248,24 +289,25 @@ class HighPerformanceYuNetDetector:
             if not os.path.exists(self.model_path):
                 raise FileNotFoundError(f"Model file not found: {self.model_path}")
             
-            # Initialize with CPU backend (more stable for concurrent processing)
+            # Initialize with STRICTER thresholds
             self.detector = cv2.FaceDetectorYN.create(
                 model=self.model_path,
                 config="",
                 input_size=(320, 320),
-                score_threshold=self.config.conf_threshold,
-                nms_threshold=self.config.nms_threshold,
-                top_k=5000,
+                score_threshold=0.7,  
+                nms_threshold=0.3,
+                top_k=50,  
                 backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
                 target_id=cv2.dnn.DNN_TARGET_CPU
             )
             
-            logger.info(f"✅ High-performance YuNet detector initialized")
+            logger.info(f"✅ High-performance face detector initialized")
             logger.info(f"   Model: {self.model_path}")
             logger.info(f"   Thresholds: conf={self.config.conf_threshold}, nms={self.config.nms_threshold}")
+            logger.info(f"   Max faces per image: {self.config.max_faces_per_image}")
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize YuNet detector: {e}")
+            logger.error(f"❌ Failed to initialize face detector: {e}")
             raise
     
     @performance_monitor
@@ -281,7 +323,7 @@ class HighPerformanceYuNetDetector:
                 _, _ = self.detector.detect(dummy_img)
             
             self.model_warmed = True
-            logger.info("✅ YuNet model thoroughly warmed up")
+            logger.info("✅ Face detection model thoroughly warmed up")
             
         except Exception as e:
             logger.warning(f"⚠️ Model warm up failed: {e}")
@@ -430,12 +472,11 @@ def get_optimized_detector() -> HighPerformanceYuNetDetector:
         with _detector_lock:
             if _detector_instance is None:
                 _detector_instance = HighPerformanceYuNetDetector()
-                logger.info("🚀 High-performance YuNet detector created")
+                logger.info("🚀 High-performance face detector created")
     
     return _detector_instance
 
 # ===== OPTIMIZED IMAGE PROCESSING =====
-
 class OptimizedImageProcessor:
     """High-performance image processing with advanced optimizations"""
     
@@ -517,14 +558,14 @@ class OptimizedImageProcessor:
         except Exception as e:
             logger.error(f"❌ Batch preprocessing error: {e}")
             return None
-
+        
 # ===== OPTIMIZED FACE PROCESSING =====
 
 @performance_monitor
 def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
     """Highly optimized face processing with batch operations"""
     try:
-        # Load image with optimized reading
+        # FIX: Call safe_imread as a static method properly
         img = OptimizedImageProcessor.safe_imread(file_path)
         if img is None:
             logger.warning(f"❌ Failed to read image: {file_path}")
@@ -682,19 +723,88 @@ class OptimizedNetworkClient:
 # Global network client
 network_client = OptimizedNetworkClient()
 
-# ===== OPTIMIZED BATCH UPLOAD =====
-
 @performance_monitor
 def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]], 
                                     db_session=None, 
-                                    max_retries: int = 3) -> Tuple[bool, str]:
-    """Ultra-optimized batch upload with database session management"""
+                                    max_retries: int = 3,
+                                    max_batch_size: int = 15):  # CHANGED from 50 to 15
+    """Ultra-optimized batch upload with smaller, faster batches"""
     
     if not files_data_list:
         logger.error("❌ No files to upload")
         return False, "No files provided"
     
-    logger.info(f"🚀 Starting optimized batch upload: {len(files_data_list)} files")
+    total_files = len(files_data_list)
+    logger.info(f"🚀 Starting optimized batch upload: {total_files} files")
+    
+    # CHANGED: Use smaller batch size for faster uploads
+    if total_files > max_batch_size:
+        logger.info(f"📦 Splitting {total_files} files into batches of {max_batch_size}")
+        return _process_large_batch_with_splitting(files_data_list, db_session, max_retries, max_batch_size)
+    
+    return _process_single_batch(files_data_list, db_session, max_retries)
+
+def _process_large_batch_with_splitting(files_data_list: List[Dict[str, Any]], 
+                                      db_session=None, 
+                                      max_retries: int = 3,
+                                      max_batch_size: int = 50) -> Tuple[bool, str]:
+    """Process large batch by splitting into smaller chunks"""
+    
+    total_files = len(files_data_list)
+    num_batches = (total_files + max_batch_size - 1) // max_batch_size  # Ceiling division
+    
+    logger.info(f"🔄 Processing {total_files} files in {num_batches} batches of {max_batch_size}")
+    
+    successful_uploads = 0
+    failed_uploads = 0
+    failed_batches = []
+    
+    for batch_num in range(num_batches):
+        start_idx = batch_num * max_batch_size
+        end_idx = min(start_idx + max_batch_size, total_files)
+        batch_chunk = files_data_list[start_idx:end_idx]
+        
+        logger.info(f"📤 Processing batch {batch_num + 1}/{num_batches}: files {start_idx + 1}-{end_idx}")
+        
+        try:
+            success, message = _process_single_batch(batch_chunk, db_session, max_retries)
+            
+            if success:
+                successful_uploads += len(batch_chunk)
+                logger.info(f"✅ Batch {batch_num + 1} completed: {len(batch_chunk)} files")
+            else:
+                failed_uploads += len(batch_chunk)
+                failed_batches.append(batch_num + 1)
+                logger.error(f"❌ Batch {batch_num + 1} failed: {message}")
+                
+        except Exception as e:
+            failed_uploads += len(batch_chunk)
+            failed_batches.append(batch_num + 1)
+            logger.error(f"❌ Batch {batch_num + 1} error: {e}")
+        
+        # Small delay between batches to prevent server overload
+        if batch_num < num_batches - 1:  # Don't sleep after last batch
+            time.sleep(1)
+    
+    # Summary
+    success_rate = (successful_uploads / total_files) * 100 if total_files > 0 else 0
+    
+    if failed_batches:
+        message = f"Split batch upload: {successful_uploads}/{total_files} successful ({success_rate:.1f}%). Failed batches: {failed_batches}"
+        logger.warning(f"⚠️ {message}")
+        return successful_uploads > 0, message
+    else:
+        message = f"Split batch upload: {successful_uploads}/{total_files} successful (100%)"
+        logger.info(f"✅ {message}")
+        return True, message
+
+def _process_single_batch(files_data_list: List[Dict[str, Any]], 
+                         db_session=None, 
+                         max_retries: int = 3) -> Tuple[bool, str]:
+    """Process a single batch (≤50 files)"""
+    
+    batch_size = len(files_data_list)
+    logger.info(f"🔧 Processing single batch: {batch_size} files")
     
     try:
         # Quick connectivity check
@@ -705,10 +815,10 @@ def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]],
         session = network_client.get_session()
         url = f"{API_BASE}/faces/batch-upload-embedding"
         
-        # Optimized upload attempts
+        # Upload attempts with retry
         for attempt in range(max_retries):
             try:
-                logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries}")
+                logger.info(f"📤 Upload attempt {attempt + 1}/{max_retries} for {batch_size} files")
                 
                 # Prepare multipart data efficiently
                 files, form_data = _prepare_multipart_data_optimized(files_data_list)
@@ -720,7 +830,7 @@ def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]],
                 # Calculate dynamic timeout based on file count and sizes
                 timeout = _calculate_optimal_timeout(files_data_list, attempt)
                 
-                logger.info(f"🌐 Uploading to: {url} (timeout: {timeout}s)")
+                logger.info(f"🌐 Uploading {batch_size} files to: {url} (timeout: {timeout}s)")
                 
                 # Make request with optimal settings
                 response = session.post(
@@ -728,7 +838,7 @@ def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]],
                     files=files,
                     data=form_data,
                     timeout=timeout,
-                    stream=False  # Don't stream for batch uploads
+                    stream=False
                 )
                 
                 # Process response
@@ -780,7 +890,7 @@ def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]],
     except Exception as e:
         logger.error(f"❌ Fatal upload error: {e}")
         return False, f"Fatal error: {str(e)}"
-
+    
 def _prepare_multipart_data_optimized(files_data_list: List[Dict[str, Any]]) -> Tuple[List, List]:
     """Optimized multipart data preparation"""
     files = []
@@ -831,12 +941,13 @@ def _validate_multipart_data(files: List, form_data: List, expected_count: int) 
     return True
 
 def _calculate_optimal_timeout(files_data_list: List[Dict[str, Any]], attempt: int) -> int:
-    """Calculate optimal timeout based on file sizes and attempt number"""
-    base_timeout = 60
-    file_count_factor = len(files_data_list) * 2
-    attempt_factor = attempt * 30
+    """Calculate optimal timeout - FASTER for smaller batches"""
+    base_timeout = 30  # CHANGED from 60
+    file_count_factor = len(files_data_list) * 1  # CHANGED from 2
+    attempt_factor = attempt * 10  # CHANGED from 30
     
     return base_timeout + file_count_factor + attempt_factor
+
 
 def _process_upload_response(response: requests.Response, file_count: int) -> Tuple[bool, str]:
     """Process upload response efficiently"""
@@ -958,13 +1069,14 @@ def validate_files_data_optimized(files_data_list: List[Dict[str, Any]]) -> Tupl
 @performance_monitor
 def process_batch_faces_and_upload_optimized(files_list: List[str], 
                                            allowed_paths: List[str], 
-                                           db_session=None) -> Tuple[bool, str]:
-    """Ultra-optimized batch processing with database session management"""
+                                           db_session=None,
+                                           max_upload_batch_size: int = 50) -> Tuple[bool, str]:
+    """Ultra-optimized batch processing with configurable upload batch size"""
     
     thread_name = threading.current_thread().name
-    logger.info(f"🚀 [{thread_name}] Starting optimized batch: {len(files_list)} files")
+    logger.info(f"🚀 [{thread_name}] Starting optimized batch: {len(files_list)} files (max upload batch: {max_upload_batch_size})")
     
-    # Process all files for faces
+    # Process all files for faces (unchanged)
     files_data = []
     processing_errors = []
     
@@ -1027,7 +1139,7 @@ def process_batch_faces_and_upload_optimized(files_list: List[str],
     # Log processing errors
     if processing_errors:
         logger.warning(f"⚠️ [{thread_name}] Processing errors: {len(processing_errors)}")
-        for error in processing_errors[:3]:  # Log first 3 errors
+        for error in processing_errors[:3]:
             logger.warning(f"   {error}")
         if len(processing_errors) > 3:
             logger.warning(f"   ... and {len(processing_errors) - 3} more errors")
@@ -1040,11 +1152,11 @@ def process_batch_faces_and_upload_optimized(files_list: List[str],
     if not is_valid:
         return False, f"Validation failed: {validation_message}"
     
-    # Upload batch with database session
-    logger.info(f"🚀 [{thread_name}] Starting optimized upload...")
+    # Upload batch with configurable batch size
+    logger.info(f"🚀 [{thread_name}] Starting optimized upload with max batch size: {max_upload_batch_size}")
     upload_start = time.time()
     
-    success, message = batch_upload_to_backend_optimized(files_data, db_session)
+    success, message = batch_upload_to_backend_optimized(files_data, db_session, max_retries=3, max_batch_size=max_upload_batch_size)
     
     upload_time = time.time() - upload_start
     total_time = time.time() - start_time
@@ -1056,8 +1168,72 @@ def process_batch_faces_and_upload_optimized(files_list: List[str],
     
     return success, message
 
-# ===== OPTIMIZED WORKER CLASSES =====
+@performance_monitor
+def process_batch_faces_and_upload_turbo(files_list: List[str], 
+                                        allowed_paths: List[str], 
+                                        db_session=None,
+                                        max_upload_batch_size: int = 15):  # CHANGED from 50
+    """TURBO version with parallel processing"""
+    
+    thread_name = threading.current_thread().name
+    logger.info(f"🚀 [{thread_name}] TURBO BATCH: {len(files_list)} files")
+    
+    # PARALLEL FACE PROCESSING
+    processor = ParallelBatchProcessor(max_workers=4)
+    start_time = time.time()
+    
+    # Process all files in parallel
+    results = processor.process_files_parallel(files_list)
+    
+    processing_time = time.time() - start_time
+    logger.info(f"⚡ [{thread_name}] Parallel processing: {len(results)} files in {processing_time:.2f}s")
+    
+    if not results:
+        return False, "No files ready for upload"
+    
+    # Prepare upload data
+    files_data = []
+    for result in results:
+        file_path = result['file_path']
+        embeddings = result['embeddings']
+        
+        # Parse path codes
+        relative_path = get_relative_path(file_path, allowed_paths)
+        if not relative_path:
+            continue
+            
+        unit_code, outlet_code, photo_type_code = parse_codes_from_relative_path(
+            relative_path, allowed_paths[0]
+        )
+        
+        if all([unit_code, outlet_code, photo_type_code]):
+            files_data.append({
+                'file_path': file_path,
+                'unit_code': unit_code,
+                'photo_type_code': photo_type_code,
+                'outlet_code': outlet_code,
+                'faces': embeddings
+            })
+    
+    # Upload with smaller batches for faster response
+    upload_start = time.time()
+    success, message = batch_upload_to_backend_optimized(
+        files_data, 
+        db_session, 
+        max_retries=3, 
+        max_batch_size=max_upload_batch_size
+    )
+    
+    upload_time = time.time() - upload_start
+    total_time = time.time() - start_time
+    
+    logger.info(f"✅ [{thread_name}] TURBO completed in {total_time:.2f}s (processing: {processing_time:.2f}s, upload: {upload_time:.2f}s)")
+    
+    return success, message
 
+
+
+# ===== OPTIMIZED WORKER CLASSES =====
 class OptimizedBatchFaceEmbeddingWorkerSignals(QObject):
     """Optimized signals with more detailed progress tracking"""
     finished = pyqtSignal(str, bool, str)  # result_summary, success, message
@@ -1066,16 +1242,16 @@ class OptimizedBatchFaceEmbeddingWorkerSignals(QObject):
     batch_completed = pyqtSignal(int, int)  # successful_count, failed_count
     performance_update = pyqtSignal(dict)  # performance metrics
 
+
 class OptimizedBatchFaceEmbeddingWorker(QRunnable):
-    """Ultra-optimized batch worker with database session management and performance monitoring"""
+    """Ultra-optimized batch worker with parallel processing"""
     
-    def __init__(self, files_list: List[str], allowed_paths: List[str]):
+    def __init__(self, files_list: List[str], allowed_paths: List[str], max_upload_batch_size: int = 15):  # CHANGED default from 50 to 15
         super().__init__()
         self.files_list = files_list
         self.allowed_paths = allowed_paths
+        self.max_upload_batch_size = max_upload_batch_size
         self.signals = OptimizedBatchFaceEmbeddingWorkerSignals()
-        
-        # Performance tracking
         self.start_time = None
         self.performance_metrics = {
             'files_processed': 0,
@@ -1086,59 +1262,47 @@ class OptimizedBatchFaceEmbeddingWorker(QRunnable):
         }
 
     def run(self):
-        """Optimized batch processing with comprehensive error handling"""
+        """Optimized batch processing with parallel execution"""
         thread_name = threading.current_thread().name
         batch_size = len(self.files_list)
         self.start_time = time.time()
         
         try:
-            logger.info(f"🚀 [{thread_name}] Starting optimized batch worker: {batch_size} files")
-            self.signals.progress.emit("batch", f"🔄 Processing {batch_size} files")
+            logger.info(f"🚀 [{thread_name}] Starting TURBO worker: {batch_size} files")
+            self.signals.progress.emit("batch", f"🔄 Processing {batch_size} files in parallel...")
             
-            # Use database session manager
             with db_manager.get_session() as db_session:
-                # Process batch with database session
-                success, message = process_batch_faces_and_upload_optimized(
+                # Use TURBO processing
+                success, message = process_batch_faces_and_upload_turbo(
                     self.files_list, 
                     self.allowed_paths, 
-                    db_session
+                    db_session,
+                    max_upload_batch_size=self.max_upload_batch_size
                 )
                 
-                # Update performance metrics
                 self._update_performance_metrics(success)
                 
                 if success:
-                    self.signals.progress.emit("batch", "✅ Optimized batch upload completed")
+                    self.signals.progress.emit("batch", "✅ Turbo batch completed")
                     self.signals.finished.emit(f"Batch successful: {batch_size} files", True, message)
                     self.signals.batch_completed.emit(batch_size, 0)
-                    logger.info(f"✅ [{thread_name}] Optimized batch completed successfully")
                 else:
-                    self.signals.progress.emit("batch", "❌ Optimized batch upload failed")
+                    self.signals.progress.emit("batch", "❌ Turbo batch failed")
                     self.signals.finished.emit(f"Batch failed: {batch_size} files", False, message)
                     self.signals.batch_completed.emit(0, batch_size)
-                    logger.error(f"❌ [{thread_name}] Optimized batch failed: {message}")
                 
-        except SQLAlchemyError as e:
-            error_message = f"Database error in thread {thread_name}: {str(e)}"
-            logger.error(f"❌ {error_message}")
-            self.signals.error.emit("batch", error_message)
-            self.signals.finished.emit("Database error", False, error_message)
-            self.signals.batch_completed.emit(0, len(self.files_list))
-            
         except Exception as e:
-            error_message = f"Optimized batch worker error in thread {thread_name}: {str(e)}"
+            error_message = f"Turbo worker error: {str(e)}"
             logger.error(f"❌ {error_message}")
             self.signals.error.emit("batch", error_message)
             self.signals.finished.emit("Batch error", False, error_message)
             self.signals.batch_completed.emit(0, len(self.files_list))
-            
-        finally:
-            # Emit final performance metrics
-            self.signals.performance_update.emit(self.performance_metrics)
+
     
     def _update_performance_metrics(self, success: bool):
         """Update performance metrics"""
         total_time = time.time() - self.start_time
+        
         
         self.performance_metrics.update({
             'total_time': total_time,

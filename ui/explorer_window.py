@@ -1,11 +1,11 @@
-# ui/explorer_window.py - FULLY OPTIMIZED HIGH PERFORMANCE VERSION
+# ui/explorer_window.py
 
 import sys
 import os
 import time
 import logging
 from datetime import datetime
-from queue import Queue
+
 from PyQt5.QtWidgets import (
     QMainWindow, QListView, QFileDialog, QTextEdit, QPushButton, 
     QVBoxLayout, QWidget, QHBoxLayout, QLabel, QLineEdit, 
@@ -14,9 +14,12 @@ from PyQt5.QtWidgets import (
     QComboBox, QTabWidget, QSplitter
 )
 from PyQt5.QtGui import QPixmap, QIcon, QFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QThreadPool
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QThreadPool, QRunnable
 import cv2
 import numpy as np
+from utils.face_detector import OptimizedBatchFaceEmbeddingWorker
+from utils.file_queue import TurboFileQueue
+
 
 # Import dengan try-except untuk avoid errors
 try:
@@ -37,256 +40,79 @@ except ImportError:
 # HIGH PERFORMANCE: Import face detection workers
 try:
     from utils.face_detector import FaceEmbeddingWorker, OptimizedBatchFaceEmbeddingWorker
-    print("✅ Imported workers from utils.face_detection_yunet")
+    print("✅ Imported workers from utils.face_detector")
 except ImportError:
-    try:
-        from utils.face_detector import FaceEmbeddingWorker, OptimizedBatchFaceEmbeddingWorker
-        print("✅ Imported workers from utils.face_detector")
-    except ImportError:
-        try:
-            from utils.face_detector import FaceEmbeddingWorker, OptimizedBatchFaceEmbeddingWorker
-            print("✅ Imported workers from face_detection_yunet")
-        except ImportError:
-            print("❌ Warning: Face detection workers not found")
-            FaceEmbeddingWorker = None
-            OptimizedBatchFaceEmbeddingWorker = None
+    print("❌ Warning: Face detection workers not found")
+    FaceEmbeddingWorker = None
+    OptimizedBatchFaceEmbeddingWorker = None
 
 logger = logging.getLogger(__name__)
 
-class HighPerformanceFileChecker(QThread):
-    """Ultra-fast file checker with multiple validation modes"""
-    
-    file_ready = pyqtSignal(str)
-    file_failed = pyqtSignal(str, str)
-    
-    def __init__(self, file_path, validation_mode="fast", parent=None):
-        super().__init__(parent)
-        self.file_path = file_path
-        self.validation_mode = validation_mode
-        
-    def run(self):
-        try:
-            if self.validation_mode == "instant":
-                self._instant_check()
-            elif self.validation_mode == "fast":
-                self._fast_check()
-            elif self.validation_mode == "balanced":
-                self._balanced_check()
-            else:  # thorough
-                self._thorough_check()
-                
-        except Exception as e:
-            self.file_failed.emit(self.file_path, f"Validation error: {e}")
+class WorkerSignals(QObject):
+    """Worker signals for threading"""
+    finished = pyqtSignal(str, bool, str)  # result_summary, success, message
+    error = pyqtSignal(str, str)  # file_path, error_message
+    progress = pyqtSignal(str, str)  # current_file, status
+    batch_completed = pyqtSignal(int, int)  # successful_count, failed_count
 
-    def _instant_check(self):
-        """Instant validation - no waiting"""
-        try:
-            if os.path.exists(self.file_path) and os.path.getsize(self.file_path) > 0:
-                self.file_ready.emit(self.file_path)
-            else:
-                self.file_failed.emit(self.file_path, "Instant check failed")
-        except Exception as e:
-            self.file_failed.emit(self.file_path, f"Instant check error: {e}")
-
-    def _fast_check(self):
-        """Fast validation - 1 second wait"""
-        try:
-            self.msleep(1000)  # 1 second only
-            
-            if not os.path.exists(self.file_path):
-                self.file_failed.emit(self.file_path, "File not found")
-                return
-                
-            size = os.path.getsize(self.file_path)
-            if size == 0:
-                self.msleep(1000)  # Wait 1 more second for empty files
-                size = os.path.getsize(self.file_path)
-                
-            if size > 0:
-                self.file_ready.emit(self.file_path)
-            else:
-                self.file_failed.emit(self.file_path, "Fast validation failed")
-                
-        except Exception as e:
-            self.file_failed.emit(self.file_path, f"Fast check error: {e}")
-
-    def _balanced_check(self):
-        """Balanced validation - 3 second wait"""
-        try:
-            self.msleep(2000)  # 2 seconds wait
-            
-            if not os.path.exists(self.file_path):
-                self.file_failed.emit(self.file_path, "File not found")
-                return
-                
-            initial_size = os.path.getsize(self.file_path)
-            if initial_size == 0:
-                self.msleep(2000)
-                initial_size = os.path.getsize(self.file_path)
-                
-            if initial_size > 0:
-                # Check stability
-                self.msleep(1000)
-                current_size = os.path.getsize(self.file_path)
-                
-                if current_size == initial_size:
-                    self.file_ready.emit(self.file_path)
-                else:
-                    self.file_failed.emit(self.file_path, "File still changing")
-            else:
-                self.file_failed.emit(self.file_path, "Balanced validation failed")
-                
-        except Exception as e:
-            self.file_failed.emit(self.file_path, f"Balanced check error: {e}")
-
-    def _thorough_check(self):
-        """Thorough validation - original method"""
-        try:
-            self.msleep(1500)
-            
-            for attempt in range(5):
-                try:
-                    if not os.path.exists(self.file_path):
-                        self.msleep(1000)
-                        continue
-                        
-                    size = os.path.getsize(self.file_path)
-                    if size == 0:
-                        self.msleep(1000)
-                        continue
-                    
-                    self.msleep(1000 + (attempt * 500))
-                    
-                    if os.path.exists(self.file_path) and os.path.getsize(self.file_path) == size:
-                        img = cv2.imread(self.file_path)
-                        if img is not None and img.size > 0:
-                            self.file_ready.emit(self.file_path)
-                            return
-                    
-                except Exception:
-                    pass
-                
-                self.msleep(1000)
-            
-            self.file_failed.emit(self.file_path, "Thorough validation failed")
-            
-        except Exception as e:
-            self.file_failed.emit(self.file_path, f"Thorough check error: {e}")
-
-class TurboFileQueue(QObject):
-    """Ultra-high performance file queue with concurrent processing"""
-    
-    file_ready = pyqtSignal(str)
-    file_failed = pyqtSignal(str, str)
-    queue_status = pyqtSignal(int, int)  # queue_size, processing_count
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.queue = Queue()
-        self.processing_count = 0
-        self.should_stop = False
-        self.max_concurrent = 5        # Process up to 5 files simultaneously
-        self.validation_mode = "fast"  # Default validation mode
-        
-        # Ultra-fast processing timer
-        self.process_timer = QTimer(self)
-        self.process_timer.timeout.connect(self._process_multiple)
-        self.process_timer.start(25)  # Check every 25ms for ultra-fast response
-    
-    def set_validation_mode(self, mode):
-        """Set validation mode: instant, fast, balanced, thorough"""
-        self.validation_mode = mode
-        print(f"⚡ Validation mode: {mode.upper()}")
-    
-    def set_max_concurrent(self, count):
-        """Set maximum concurrent file processing"""
-        self.max_concurrent = max(1, min(count, 10))  # Between 1-10
-        print(f"⚡ Max concurrent processing: {self.max_concurrent}")
-    
-    def add_file(self, file_path):
-        """Add file to processing queue"""
-        self.queue.put(file_path)
-        self.queue_status.emit(self.queue.qsize(), self.processing_count)
-        return True
-    
-    def _process_multiple(self):
-        """Process multiple files concurrently for maximum performance"""
-        if self.should_stop:
-            return
-        
-        # Start new checkers if we have capacity and files
-        while (self.processing_count < self.max_concurrent and not self.queue.empty()):
-            file_path = self.queue.get()
-            self.processing_count += 1
-            self.queue_status.emit(self.queue.qsize(), self.processing_count)
-            
-            # Create high-performance checker
-            checker = HighPerformanceFileChecker(file_path, self.validation_mode, self)
-            checker.file_ready.connect(self._on_file_ready)
-            checker.file_failed.connect(self._on_file_failed)
-            checker.start()
-    
-    def _on_file_ready(self, file_path):
-        """Handle file ready"""
-        self.processing_count -= 1
-        self.queue_status.emit(self.queue.qsize(), self.processing_count)
-        self.file_ready.emit(file_path)
-    
-    def _on_file_failed(self, file_path, reason):
-        """Handle file failed"""
-        self.processing_count -= 1
-        self.queue_status.emit(self.queue.qsize(), self.processing_count)
-        self.file_failed.emit(file_path, reason)
-    
-    def get_queue_size(self):
-        return self.queue.qsize()
-    
-    def get_processing_count(self):
-        return self.processing_count
-    
-    def stop(self):
-        self.should_stop = True
-        self.process_timer.stop()
 
 class ExplorerWindow(QMainWindow):
-    """ULTRA HIGH PERFORMANCE Explorer Window"""
+    """HIGH PERFORMANCE Explorer Window"""
     
     def __init__(self, config_manager):
         super().__init__()
         self.threadpool = QThreadPool()
         self.config_manager = config_manager
-        self.setWindowTitle("FaceSync - TURBO MODE 🚀")
+        self.setWindowTitle("FaceSync - Uploader")
         self.setGeometry(100, 100, 1400, 900)
         
-        # TURBO PERFORMANCE: File processing
+        # File processing
         self.file_queue = TurboFileQueue(self)
         self.file_queue.file_ready.connect(self._on_file_ready)
         self.file_queue.file_failed.connect(self._on_file_failed)
         self.file_queue.queue_status.connect(self._on_queue_status_changed)
 
-        # ULTRA PERFORMANCE MODES
+        # PERFORMANCE MODES
         self.performance_modes = {
             'turbo': {
-                'batch_size': 1, 'timeout': 0, 'validation': 'instant',
-                'concurrent': 5, 'description': ''
+                'batch_size': 10,  # Reduce from 25
+                'timeout': 0.5,    # Reduce from 1
+                'validation': 'instant',
+                'concurrent': 10,  # Increase from 5
+                'upload_batch_size': 15,  # Reduce from 20
             },
             'speed': {
-                'batch_size': 2, 'timeout': 0.5, 'validation': 'fast', 
-                'concurrent': 4, 'description': ''
+                'batch_size': 25, 'timeout': 1, 'validation': 'fast', 
+                'concurrent': 4, 'upload_batch_size': 30,
+                'description': 'Send every 25 files or 1s'
+            },
+            'fast': {
+                'batch_size': 40, 'timeout': 2, 'validation': 'fast',
+                'concurrent': 3, 'upload_batch_size': 50,
+                'description': 'Send every 40 files or 2s'
+            },
+            'balanced': {
+                'batch_size': 50, 'timeout': 3, 'validation': 'balanced',
+                'concurrent': 2, 'upload_batch_size': 50,
+                'description': 'Send every 50 files or 3s'
             },
             'stable': {
-                'batch_size': 20, 'timeout': 5, 'validation': 'thorough',
-                'concurrent': 1, 'description': ''
+                'batch_size': 50, 'timeout': 5, 'validation': 'thorough',
+                'concurrent': 1, 'upload_batch_size': 50,
+                'description': 'Send every 50 files or 5s'
             }
         }
         
-        self.current_mode = 'speed'  # Default to speed mode
+        self.current_mode = 'turbo'  # Default to speed mode
         self._apply_performance_mode(self.current_mode)
         
         # Batch processing
         self.use_batch_upload = True
         self.batch_queue = []
         self.batch_processing = False
+        
+        # Upload batch size configuration
+        self.upload_batch_size = self.performance_modes[self.current_mode]['upload_batch_size']
         
         # State tracking
         self.failed_files = set()
@@ -305,6 +131,9 @@ class ExplorerWindow(QMainWindow):
         self.start_time = time.time()
         self.last_processed_time = time.time()
         
+        # Initialize batch timer
+        self.batch_timer = None
+        
         self._init_ui()
         self._setup_connections()
         self._load_initial_path()
@@ -313,8 +142,6 @@ class ExplorerWindow(QMainWindow):
         self._start_performance_monitoring()
         
         # Log startup
-        self.log_with_timestamp("🚀 TURBO MODE ACTIVATED")
-        self.log_with_timestamp(f"⚡ Mode: {self.current_mode.upper()}")
         self.log_with_timestamp(f"📦 Batch: {self.batch_size}, Timeout: {self.batch_timeout}s")
 
     def _apply_performance_mode(self, mode):
@@ -326,11 +153,12 @@ class ExplorerWindow(QMainWindow):
         self.max_concurrent = settings['concurrent']
         
         # Apply to file queue
-        self.file_queue.set_validation_mode(self.validation_mode)
-        self.file_queue.set_max_concurrent(self.max_concurrent)
+        if hasattr(self, 'file_queue'):
+            self.file_queue.set_validation_mode(self.validation_mode)
+            self.file_queue.set_max_concurrent(self.max_concurrent)
 
     def _init_ui(self):
-        """Initialize ultra-modern UI"""
+        """Initialize modern UI"""
         # Create main splitter
         main_splitter = QSplitter(Qt.Vertical)
         
@@ -381,29 +209,7 @@ class ExplorerWindow(QMainWindow):
         path_layout.addStretch()
         path_layout.addWidget(self.retry_button)
         path_layout.addWidget(self.admin_button)
-        
-        # Search
-        # self.search_input = QLineEdit()
-        # self.search_input.setPlaceholderText("🔍 Search files...")
-        
-        # Performance mode selector
-        perf_group = QGroupBox("🚀 PERFORMANCE MODES")
-        perf_layout = QHBoxLayout()
-        
-        perf_layout.addWidget(QLabel("Mode:"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(list(self.performance_modes.keys()))
-        self.mode_combo.setCurrentText(self.current_mode)
-        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
-        perf_layout.addWidget(self.mode_combo)
-        
-        self.mode_desc_label = QLabel()
-        self.mode_desc_label.setStyleSheet("color: #666; font-style: italic;")
-        self._update_mode_description()
-        perf_layout.addWidget(self.mode_desc_label)
-        
-        perf_layout.addStretch()
-        perf_group.setLayout(perf_layout)
+  
         
         # Batch settings
         batch_group = QGroupBox("📦 BATCH SETTINGS")
@@ -428,6 +234,9 @@ class ExplorerWindow(QMainWindow):
         self.batch_timeout_spin.setSuffix("s")
         self.batch_timeout_spin.valueChanged.connect(self._on_batch_timeout_changed)
         batch_layout.addWidget(self.batch_timeout_spin)
+        
+        # Force send button
+        
         
         batch_layout.addStretch()
         batch_group.setLayout(batch_layout)
@@ -462,7 +271,7 @@ class ExplorerWindow(QMainWindow):
         progress_group = QGroupBox("⚡ PROCESSING STATUS")
         progress_layout = QVBoxLayout()
         
-        self.overall_progress = QLabel("🚀 Ready for turbo processing")
+        self.overall_progress = QLabel("🚀 App is ready")
         self.overall_progress.setStyleSheet("font-weight: bold; color: #2196F3;")
         progress_layout.addWidget(self.overall_progress)
         
@@ -477,14 +286,13 @@ class ExplorerWindow(QMainWindow):
         
         # Add all to main layout
         layout.addLayout(path_layout)
-        # layout.addWidget(self.search_input)
-        layout.addWidget(perf_group)
+        # layout.addWidget(perf_group)
         layout.addWidget(batch_group)
         layout.addWidget(metrics_group)
         layout.addWidget(progress_group)
         
         return widget
-
+        
     def _create_middle_section(self):
         """Create file list section"""
         self.file_list = QListWidget(self)
@@ -503,7 +311,7 @@ class ExplorerWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         
         log_header = QHBoxLayout()
-        log_label = QLabel("📋 TURBO LOGS")
+        log_label = QLabel("📋 LOGS")
         log_label.setStyleSheet("font-weight: bold;")
         
         self.clear_logs_btn = QPushButton("🗑️ Clear")
@@ -529,7 +337,6 @@ class ExplorerWindow(QMainWindow):
         self.admin_button.clicked.connect(self.show_admin_settings)
         self.back_button.clicked.connect(self.go_back)
         self.file_list.itemDoubleClicked.connect(self.open_file)
-        # self.search_input.textChanged.connect(self.filter_file_list)
 
     def _load_initial_path(self):
         """Load initial path if available"""
@@ -569,56 +376,74 @@ class ExplorerWindow(QMainWindow):
             self._process_batch()
 
     def _on_file_ready(self, file_path):
-        """Handle file ready for processing - TURBO OPTIMIZED"""
+        """Handle file ready - IMMEDIATE SENDING when batch is full"""
         filename = os.path.basename(file_path)
         
         if self.use_batch_upload:
             self.batch_queue.append(file_path)
-            self.log_with_timestamp(f"⚡ Added to batch: {filename}")
+            current_batch_size = len(self.batch_queue)
             
-            # TURBO MODE LOGIC
+            self.log_with_timestamp(f"⚡ Added to batch: {filename} (queue: {current_batch_size}/{self.batch_size})")
+            
+            # IMMEDIATE SENDING LOGIC
             if self.current_mode == 'turbo':
-                # Process immediately
-                self.log_with_timestamp(f"🚀 TURBO processing: {filename}")
+                # TURBO: Send immediately, no batching
+                self.log_with_timestamp(f"Sending immediately - {filename}")
                 self._process_batch()
-            elif len(self.batch_queue) >= self.batch_size:
-                # Batch full - process immediately
-                self.log_with_timestamp(f"📦 Batch full ({self.batch_size}) - processing")
+                
+            elif current_batch_size >= self.batch_size:
+                # BATCH FULL: Send immediately when batch size reached
+                self.log_with_timestamp(f"📦 BATCH FULL ({self.batch_size} files) - sending immediately!")
                 self._process_batch()
+                
             elif self.batch_timeout > 0:
-                # Set timer for timeout
+                # START/RESTART TIMER: Will send when timeout reached
+                self.log_with_timestamp(f"⏱️ Batch timer: will send in {self.batch_timeout}s if no more files")
                 self._set_batch_timer()
         else:
             # Single file processing
             self.log_with_timestamp(f"🔥 Processing single: {filename}")
-            # Could add single file processing here
+            # TODO: Implement single file processing if needed
 
     def _set_batch_timer(self):
-        """Set timer for batch processing"""
+        """Set/restart timer for batch timeout - IMMEDIATE SENDING on timeout"""
         if self.batch_timeout <= 0:
             return  # No timer for instant modes
             
-        # Reset timer if already active
-        if hasattr(self, 'batch_timer') and self.batch_timer.isActive():
+        # ALWAYS restart timer when new file arrives
+        if self.batch_timer and self.batch_timer.isActive():
             self.batch_timer.stop()
+            self.log_with_timestamp(f"⏱️ Restarting batch timer: {self.batch_timeout}s")
         
-        if not hasattr(self, 'batch_timer'):
+        if not self.batch_timer:
             self.batch_timer = QTimer()
             self.batch_timer.timeout.connect(self._auto_process_batch)
             self.batch_timer.setSingleShot(True)
         
-        # Start timer
+        # Convert float seconds to integer milliseconds
         timeout_ms = int(self.batch_timeout * 1000)
         self.batch_timer.start(timeout_ms)
 
     def _auto_process_batch(self):
-        """AUTO process batch when timer expires"""
+        """AUTO send batch when timer expires - IMMEDIATE SENDING"""
         if self.batch_queue and not self.batch_processing:
-            self.log_with_timestamp(f"⏰ Auto-processing batch: {len(self.batch_queue)} files")
+            batch_size = len(self.batch_queue)
+            self.log_with_timestamp(f"⏰ TIMEOUT REACHED - sending {batch_size} files immediately")
             self._process_batch()
+        else:
+            self.log_with_timestamp("⏰ Timer expired but no files to send")
+
+    def _force_send_batch(self):
+        """Force send current batch"""
+        if self.batch_queue and not self.batch_processing:
+            batch_size = len(self.batch_queue)
+            self.log_with_timestamp(f"🚀 FORCE SEND - sending {batch_size} files now")
+            self._process_batch()
+        else:
+            self.log_with_timestamp("📭 No files to send or already processing")
 
     def _process_batch(self):
-        """Process current batch - TURBO OPTIMIZED"""
+        """Process current batch - IMMEDIATE SENDING with optimal upload batch size"""
         if not self.batch_queue or self.batch_processing:
             return
         
@@ -626,23 +451,28 @@ class ExplorerWindow(QMainWindow):
             self.log_with_timestamp("❌ BatchFaceEmbeddingWorker not available")
             return
         
-        # Stop timer
-        if hasattr(self, 'batch_timer') and self.batch_timer.isActive():
+        # Stop timer since we're processing now
+        if self.batch_timer and self.batch_timer.isActive():
             self.batch_timer.stop()
         
+        # Take current batch for processing
         batch_files = self.batch_queue.copy()
-        self.batch_queue.clear()
+        self.batch_queue.clear()  # Clear queue immediately for new files
         self.batch_processing = True
         
-        self.log_with_timestamp(f"🚀 PROCESSING batch: {len(batch_files)} files")
+        self.log_with_timestamp(f"🚀 SENDING BATCH: {len(batch_files)} files (upload chunks: {self.upload_batch_size})")
         
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.overall_progress.setText(f"🚀 Processing {len(batch_files)} files")
+        self.overall_progress.setText(f"🚀 Sending {len(batch_files)} files")
         
-        # Create and start worker
-        worker = OptimizedBatchFaceEmbeddingWorker(batch_files, self.allowed_paths)
+        # Create and start worker with optimal upload batch size
+        worker = OptimizedBatchFaceEmbeddingWorker(
+            batch_files, 
+            self.allowed_paths, 
+            max_upload_batch_size=self.upload_batch_size
+        )
         worker.signals.progress.connect(self._on_batch_progress)
         worker.signals.finished.connect(self._on_batch_finished)
         worker.signals.error.connect(self._on_batch_error)
@@ -657,18 +487,26 @@ class ExplorerWindow(QMainWindow):
             self.log_with_timestamp(f"🔍 Processing: {filename}")
 
     def _on_batch_finished(self, result_summary, success, message):
-        """Handle batch completion"""
+        """Handle batch completion - READY FOR NEXT BATCH IMMEDIATELY"""
         self.batch_processing = False
         self.progress_bar.setVisible(False)
         self.overall_progress.setText("🚀 Ready for next batch")
         self.current_operation_label.setText("")
-        self.log_with_timestamp(f"✅ Batch completed: {result_summary}")
         
-        # AUTO process next batch if files waiting
+        self.log_with_timestamp(f"✅ Batch sent: {result_summary}")
+        
+        # IMMEDIATE PROCESSING: Check if new files arrived while processing
         if self.batch_queue:
-            if self.current_mode == 'turbo':
+            new_files_count = len(self.batch_queue)
+            self.log_with_timestamp(f"📦 Found {new_files_count} new files during upload")
+            
+            # If new batch is already full, send immediately
+            if new_files_count >= self.batch_size:
+                self.log_with_timestamp(f"📦 New batch already full ({new_files_count} files) - sending immediately!")
                 self._process_batch()
-            else:
+            elif self.batch_timeout > 0:
+                # Start timer for partial batch
+                self.log_with_timestamp(f"⏱️ Starting timer for {new_files_count} queued files")
                 self._set_batch_timer()
 
     def _on_batch_error(self, file_path, error_message):
@@ -691,7 +529,7 @@ class ExplorerWindow(QMainWindow):
         self.update_embedding_status()
 
     def _update_performance_metrics(self):
-        """Update performance metrics display"""
+        """Update performance metrics display with immediate sending info"""
         elapsed = time.time() - self.start_time
         rate = (self.processed_count * 60) / elapsed if elapsed > 0 else 0
         
@@ -705,35 +543,58 @@ class ExplorerWindow(QMainWindow):
         
         self.queue_label.setText(f"Queue: {queue_size}")
         self.processing_label.setText(f"Processing: {processing}")
-        self.batch_queue_label.setText(f"Batch: {batch_size}")
+        
+        # Show batch queue with immediate sending info
+        if batch_size > 0:
+            remaining_for_batch = max(0, self.batch_size - batch_size)
+            if remaining_for_batch == 0:
+                self.batch_queue_label.setText(f"Batch: {batch_size} (READY TO SEND)")
+                self.batch_queue_label.setStyleSheet("color: #FF5722; font-weight: bold;")
+            else:
+                self.batch_queue_label.setText(f"Batch: {batch_size}/{self.batch_size} (need {remaining_for_batch} more)")
+                self.batch_queue_label.setStyleSheet("color: #2196F3;")
+        else:
+            self.batch_queue_label.setText("Batch: Empty")
+            self.batch_queue_label.setStyleSheet("color: #666;")
 
     def _on_batch_upload_changed(self, state):
-        """Handle batch upload toggle"""
+        """Handle batch upload toggle with immediate sending explanation"""
         self.use_batch_upload = state == 2
-        mode = "BATCH" if self.use_batch_upload else "SINGLE"
-        self.log_with_timestamp(f"⚡ Processing mode: {mode}")
         
-        # Process current batch if switching to single mode
-        if not self.use_batch_upload and self.batch_queue:
-            self.log_with_timestamp("🔄 Switching to single mode - processing current batch")
-            self._process_batch()
+        if self.use_batch_upload:
+            mode_text = f"BATCH MODE (send every {self.batch_size} files)"
+            # Process current batch if switching to batch mode
+            if self.batch_queue:
+                self.log_with_timestamp("🔄 Switching to batch mode - sending current queue")
+                self._process_batch()
+        else:
+            mode_text = "SINGLE MODE (send immediately)"
+        
+        self.log_with_timestamp(f"⚡ Processing mode: {mode_text}")
 
     def _on_batch_size_changed(self, value):
-        """Handle batch size change"""
+        """Handle batch size change - IMMEDIATE EFFECT"""
+        old_batch_size = self.batch_size
         self.batch_size = value
-        self.log_with_timestamp(f"📦 Batch size: {value}")
+        current_queue_size = len(self.batch_queue)
         
-        # Auto-process if queue >= new size
-        if len(self.batch_queue) >= self.batch_size and not self.batch_processing:
+        self.log_with_timestamp(f"📦 Batch size changed: {old_batch_size} → {value}")
+        
+        # If current queue >= new batch size, send immediately
+        if current_queue_size >= self.batch_size and not self.batch_processing:
+            self.log_with_timestamp(f"📦 Current queue ({current_queue_size}) ≥ new batch size ({value}) - sending immediately!")
             self._process_batch()
 
     def _on_batch_timeout_changed(self, value):
-        """Handle batch timeout change"""
+        """Handle batch timeout change - IMMEDIATE EFFECT"""
+        old_timeout = self.batch_timeout
         self.batch_timeout = float(value)
-        self.log_with_timestamp(f"⏰ Batch timeout: {value}s")
         
-        # Restart timer if active
-        if hasattr(self, 'batch_timer') and self.batch_timer.isActive() and self.batch_queue:
+        self.log_with_timestamp(f"⏰ Batch timeout changed: {old_timeout}s → {value}s")
+        
+        # Restart timer with new timeout if we have queued files
+        if self.batch_timer and self.batch_timer.isActive() and self.batch_queue:
+            self.log_with_timestamp(f"⏱️ Restarting timer with new timeout: {value}s")
             self._set_batch_timer()
 
     def update_embedding_status(self):
@@ -810,7 +671,7 @@ class ExplorerWindow(QMainWindow):
         self.file_list.addItem(item)
 
     def start_monitoring(self, folder):
-        """Start folder monitoring - TURBO OPTIMIZED"""
+        """Start folder monitoring - OPTIMIZED"""
         if not os.path.isdir(folder):
             return
         
@@ -826,11 +687,12 @@ class ExplorerWindow(QMainWindow):
             
             if self.watcher_data:
                 observer, event_handler = self.watcher_data
-                self.log_with_timestamp(f"🔄 Started TURBO monitoring: {os.path.basename(folder)}")
+                self.log_with_timestamp(f"🔄 Started monitoring: {os.path.basename(folder)}")
                 
-                # Log initial status
-                stats = event_handler.get_stats()
-                self.log_with_timestamp(f"📊 Initial stats - Processed: {stats['processed']}, Pending: {stats['pending']}, Failed: {stats['failed']}")
+                # Log initial status if available
+                if hasattr(event_handler, 'get_stats'):
+                    stats = event_handler.get_stats()
+                    self.log_with_timestamp(f"📊 Initial stats - Processed: {stats['processed']}, Pending: {stats['pending']}, Failed: {stats['failed']}")
             else:
                 self.log_with_timestamp(f"❌ Failed to start monitoring: {folder}")
                 
@@ -848,12 +710,12 @@ class ExplorerWindow(QMainWindow):
                 self.log_with_timestamp(f"❌ Error stopping monitoring: {e}")
 
     def on_new_file_detected(self, file_path):
-        """Handle new file detection - TURBO MODE"""
+        """Handle new file detection - MODE"""
         filename = os.path.basename(file_path)
         if self._is_supported_image_file(filename):
             self.log_with_timestamp(f"🆕 New image detected: {filename}")
             if self.file_queue.add_file(file_path):
-                self.log_with_timestamp(f"📝 Added to TURBO queue: {filename}")
+                self.log_with_timestamp(f"📝 Added to queue: {filename}")
 
     def on_file_deleted(self, file_path):
         """Handle file deletion"""
@@ -878,15 +740,20 @@ class ExplorerWindow(QMainWindow):
         failed_list = list(self.failed_files)
         self.failed_files.clear()
         
+        retry_count = 0
         for file_path in failed_list:
             if os.path.exists(file_path):
-                self.file_queue.add_file(file_path)
+                if self.file_queue.add_file(file_path):
+                    retry_count += 1
         
-        self.log_with_timestamp(f"🔄 TURBO retrying {len(failed_list)} failed files")
+        self.log_with_timestamp(f"🔄 Retrying {retry_count} failed files")
 
     def open_file(self, item):
         """Open file"""
         item_name = self.get_actual_filename(item)
+        if not item_name:
+            return
+            
         item_path = os.path.join(self.current_path, item_name)
         
         try:
@@ -902,11 +769,12 @@ class ExplorerWindow(QMainWindow):
 
     def go_back(self):
         """Navigate back"""
-        pass  # Implement if needed
-
-    def filter_file_list(self, text):
-        """Filter file list"""
-        pass  # Implement if needed
+        if self.path_history:
+            previous_path = self.path_history.pop()
+            self.set_current_path(previous_path)
+            self.load_files(previous_path)
+            self.start_monitoring(previous_path)
+            self.back_button.setEnabled(len(self.path_history) > 0)
 
     def show_admin_settings(self):
         """Show admin settings"""
@@ -941,13 +809,13 @@ class ExplorerWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle close event"""
-        self.log_with_timestamp("🔄 Shutting down TURBO mode...")
+        self.log_with_timestamp("🔄 Shutting down...")
         self.stop_monitoring()
         self.file_queue.stop()
-        if hasattr(self, 'batch_timer'):
+        if self.batch_timer and self.batch_timer.isActive():
             self.batch_timer.stop()
         if hasattr(self, 'perf_timer'):
             self.perf_timer.stop()
         self.threadpool.waitForDone(3000)
-        self.log_with_timestamp("✅ TURBO mode closed")
+        self.log_with_timestamp("✅ Closed")
         event.accept()
