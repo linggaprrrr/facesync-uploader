@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 from io import BytesIO
-from core.device_setup import API_BASE
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 from core.device_setup import device, resnet, API_BASE
@@ -66,12 +66,326 @@ class UploadResult:
 
 # ===== MISSING FUNCTION: Face Processing =====
 
-def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
+# ===== MISSING FUNCTION: Advanced Face Processing with SmartFaceDetector =====
+
+import math
+from PIL import Image, ExifTags
+
+class SmartFaceDetector:
+    """Smart face detector untuk registration dengan auto-rotate dan face filtering"""
+    
+    def __init__(self, model_path="models/face_detection_yunet_2023mar.onnx"):
+        try:
+            if os.path.exists(model_path):
+                self.detector = cv2.FaceDetectorYN.create(
+                    model=model_path,
+                    config="",
+                    input_size=(640, 640),
+                    score_threshold=0.6,
+                    nms_threshold=0.3,
+                    top_k=100
+                )
+                logger.info("✅ SmartFaceDetector initialized")
+            else:
+                # Fallback to default path
+                default_path = "face_detection_yunet_2023mar.onnx"
+                if os.path.exists(default_path):
+                    self.detector = cv2.FaceDetectorYN.create(
+                        model=default_path,
+                        config="",
+                        input_size=(640, 640),
+                        score_threshold=0.6,
+                        nms_threshold=0.3,
+                        top_k=100
+                    )
+                    logger.info("✅ SmartFaceDetector initialized with default path")
+                else:
+                    logger.error(f"❌ Model not found at {model_path} or {default_path}")
+                    self.detector = None
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize SmartFaceDetector: {e}")
+            self.detector = None
+    
+    def fix_image_orientation(self, image_data, force_portrait=True):
+        """
+        Rotate image using EXIF and shape detection
+        
+        Args:
+            image_data: Raw image bytes
+            force_portrait: If True, ensure output is portrait orientation
+        """
+        try:
+            pil_image = Image.open(BytesIO(image_data))
+
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+
+            # Step 1: Apply EXIF rotation first
+            exif = pil_image.getexif()
+            orientation_key = next((k for k, v in ExifTags.TAGS.items() if v == 'Orientation'), None)
+
+            if orientation_key and orientation_key in exif:
+                orientation = exif.get(orientation_key)
+                if orientation == 3:
+                    pil_image = pil_image.rotate(180, expand=True)
+                    logger.info("🔄 Rotated 180° via EXIF")
+                elif orientation == 6:
+                    pil_image = pil_image.rotate(270, expand=True)
+                    logger.info("🔄 Rotated 270° via EXIF")
+                elif orientation == 8:
+                    pil_image = pil_image.rotate(90, expand=True)
+                    logger.info("🔄 Rotated 90° via EXIF")
+                else:
+                    logger.info("ℹ️ No EXIF rotation needed (orientation = 1)")
+            else:
+                logger.info("ℹ️ No EXIF info found")
+
+            # Step 2: Check if we need shape-based rotation
+            width, height = pil_image.size
+            is_landscape = width > height
+            
+            if force_portrait and is_landscape:
+                # Detect faces to determine correct rotation
+                temp_buffer = BytesIO()
+                pil_image.save(temp_buffer, format="JPEG", quality=95)
+                temp_data = temp_buffer.getvalue()
+                
+                img_array = np.frombuffer(temp_data, np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                
+                # Try current orientation
+                faces_current = self.detect_faces_simple(img)
+                
+                # Try 90° rotation
+                img_90 = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                faces_90 = self.detect_faces_simple(img_90)
+                
+                # Try 270° rotation
+                img_270 = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                faces_270 = self.detect_faces_simple(img_270)
+                
+                # Compare face detection quality
+                score_current = self.evaluate_face_detection(faces_current, img.shape)
+                score_90 = self.evaluate_face_detection(faces_90, img_90.shape)
+                score_270 = self.evaluate_face_detection(faces_270, img_270.shape)
+                
+                logger.info(f"Face detection scores - Current: {score_current:.3f}, "
+                           f"90°: {score_90:.3f}, 270°: {score_270:.3f}")
+                
+                # Choose best rotation
+                if score_90 > max(score_current, score_270) and score_90 > 0:
+                    pil_image = pil_image.rotate(270, expand=True)  # PIL rotate is counter-clockwise
+                    logger.info("🔄 Auto-rotated 90° clockwise for portrait")
+                elif score_270 > max(score_current, score_90) and score_270 > 0:
+                    pil_image = pil_image.rotate(90, expand=True)   # PIL rotate is counter-clockwise
+                    logger.info("🔄 Auto-rotated 270° clockwise for portrait")
+                else:
+                    # If no clear winner, default to 90° rotation for portrait
+                    if is_landscape:
+                        pil_image = pil_image.rotate(270, expand=True)
+                        logger.info("🔄 Default 90° rotation for portrait (no clear face direction)")
+
+            # Final check
+            final_width, final_height = pil_image.size
+            logger.info(f"📐 Final dimensions: {final_width}x{final_height} "
+                       f"({'Portrait' if final_height > final_width else 'Landscape'})")
+
+            # Encode final result
+            output_buffer = BytesIO()
+            pil_image.save(output_buffer, format="JPEG", quality=95)
+            corrected_data = output_buffer.getvalue()
+
+            img_array = np.frombuffer(corrected_data, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+            return img, corrected_data
+
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to fix orientation: {e}")
+            img_array = np.frombuffer(image_data, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            return img, image_data
+
+    def detect_faces_simple(self, img):
+        """Simple face detection for orientation checking"""
+        try:
+            if self.detector is None:
+                return []
+            h, w = img.shape[:2]
+            self.detector.setInputSize((w, h))
+            retval, faces = self.detector.detect(img)
+            return faces if faces is not None else []
+        except:
+            return []
+    
+    def evaluate_face_detection(self, faces, img_shape):
+        """Evaluate face detection quality for orientation decision"""
+        if faces is None or len(faces) == 0:
+            return 0.0
+        
+        total_score = 0.0
+        for face in faces:
+            metrics = self.calculate_face_metrics(face, img_shape)
+            # Prioritize larger, centered faces with good confidence
+            face_score = (
+                metrics['area_ratio'] * 0.5 +  # Size matters most
+                (1 - metrics['center_distance']) * 0.3 +  # Center position
+                metrics['confidence'] * 0.2  # Detection confidence
+            )
+            total_score += face_score
+        
+        # Bonus for detecting exactly one face (typical for selfie)
+        if len(faces) == 1:
+            total_score *= 1.2
+        
+        return total_score
+    
+    def calculate_face_metrics(self, face, img_shape):
+        """Calculate face metrics untuk filtering"""
+        x, y, w, h = face[:4]
+        img_h, img_w = img_shape[:2]
+        
+        # Face area
+        face_area = w * h
+        image_area = img_w * img_h
+        area_ratio = face_area / image_area
+        
+        # Center distance (dari center image)
+        face_center_x = x + w / 2
+        face_center_y = y + h / 2
+        img_center_x = img_w / 2
+        img_center_y = img_h / 2
+        
+        center_distance = math.sqrt(
+            (face_center_x - img_center_x) ** 2 + 
+            (face_center_y - img_center_y) ** 2
+        )
+        
+        # Normalize center distance (0-1)
+        max_distance = math.sqrt(img_center_x ** 2 + img_center_y ** 2)
+        normalized_center_distance = center_distance / max_distance if max_distance > 0 else 0
+        
+        # Aspect ratio (ideal face ratio ≈ 0.75)
+        face_aspect_ratio = h / w if w > 0 else 0
+        aspect_score = 1 - abs(face_aspect_ratio - 0.75) / 0.75
+        
+        return {
+            'area_ratio': area_ratio,
+            'center_distance': normalized_center_distance,
+            'aspect_score': max(0, aspect_score),
+            'confidence': float(face[14]) if len(face) > 14 else float(face[4])
+        }
+    
+    def is_likely_selfie_face(self, face, img_shape, min_area_ratio=0.05):
+        """Determine if face is likely the main selfie subject"""
+        metrics = self.calculate_face_metrics(face, img_shape)
+        
+        # Kriteria selfie face:
+        # 1. Area cukup besar (minimal 5% dari image)
+        # 2. Posisi relatif di tengah
+        # 3. Confidence tinggi
+        
+        area_ok = metrics['area_ratio'] >= min_area_ratio
+        center_ok = metrics['center_distance'] <= 0.6  # Not too far from center
+        confidence_ok = metrics['confidence'] >= 0.7
+        
+        # Composite score
+        selfie_score = (
+            metrics['area_ratio'] * 0.4 +  # 40% weight on size
+            (1 - metrics['center_distance']) * 0.3 +  # 30% weight on center position
+            metrics['confidence'] * 0.2 +  # 20% weight on confidence
+            metrics['aspect_score'] * 0.1   # 10% weight on aspect ratio
+        )
+        
+        logger.debug(f"Face metrics: area={metrics['area_ratio']:.3f}, "
+                    f"center_dist={metrics['center_distance']:.3f}, "
+                    f"conf={metrics['confidence']:.3f}, "
+                    f"selfie_score={selfie_score:.3f}")
+        
+        return area_ok and center_ok and confidence_ok, selfie_score
+    
+    def detect_and_filter_faces(self, img, is_reference=True):
+        """Detect faces dengan smart filtering untuk selfie/reference"""
+        try:
+            if self.detector is None:
+                logger.error("❌ Detector not initialized")
+                return []
+                
+            h, w = img.shape[:2]
+            self.detector.setInputSize((w, h))
+            
+            retval, faces = self.detector.detect(img)
+            
+            if faces is None or len(faces) == 0:
+                logger.warning("❌ No faces detected")
+                return []
+            
+            logger.info(f"🔍 Detected {len(faces)} faces")
+            
+            if not is_reference:
+                # For non-reference, return all faces
+                return faces
+            
+            # For reference registration, filter untuk selfie
+            selfie_faces = []
+            face_scores = []
+            
+            for i, face in enumerate(faces):
+                is_selfie, score = self.is_likely_selfie_face(face, img.shape)
+                metrics = self.calculate_face_metrics(face, img.shape)
+                
+                logger.info(f"Face {i}: area_ratio={metrics['area_ratio']:.3f}, "
+                           f"confidence={metrics['confidence']:.3f}, "
+                           f"selfie_score={score:.3f}, is_selfie={is_selfie}")
+                
+                if is_selfie:
+                    selfie_faces.append(face)
+                    face_scores.append(score)
+            
+            if not selfie_faces:
+                # Fallback: ambil face dengan area terbesar jika tidak ada yang memenuhi kriteria selfie
+                logger.warning("⚠️ No selfie faces found, using largest face")
+                largest_face = max(faces, key=lambda f: f[2] * f[3])
+                return [largest_face]
+            
+            # Sort by selfie score dan ambil yang terbaik
+            sorted_faces = [face for _, face in sorted(zip(face_scores, selfie_faces), 
+                                                     key=lambda x: x[0], reverse=True)]
+            
+            # Untuk reference, hanya ambil 1 face terbaik
+            best_face = sorted_faces[0]
+            best_score = max(face_scores)
+            
+            logger.info(f"✅ Selected best selfie face with score: {best_score:.3f}")
+            return [best_face]
+            
+        except Exception as e:
+            logger.error(f"❌ Face detection error: {e}")
+            return []
+
+# Global smart detector instance
+_smart_detector_instance: Optional[SmartFaceDetector] = None
+_smart_detector_lock = threading.Lock()
+
+def get_smart_face_detector() -> SmartFaceDetector:
+    """Get or create smart face detector instance"""
+    global _smart_detector_instance
+    
+    if _smart_detector_instance is None:
+        with _smart_detector_lock:
+            if _smart_detector_instance is None:
+                _smart_detector_instance = SmartFaceDetector()
+                logger.info("🚀 SmartFaceDetector instance created")
+    
+    return _smart_detector_instance
+
+def process_faces_in_image_optimized(file_path: str, is_selfie_mode: bool = False) -> List[Dict[str, Any]]:
     """
-    Process faces in image and return embeddings with bounding boxes
+    Process faces in image using SmartFaceDetector with configurable detection mode
     
     Args:
         file_path: Path to image file
+        is_selfie_mode: If True, applies selfie filtering. If False, detects all faces.
         
     Returns:
         List of dictionaries containing:
@@ -80,28 +394,122 @@ def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
         - confidence: Float confidence score
     """
     try:
-        logger.debug(f"🔍 Processing faces in: {Path(file_path).name}")
+        logger.info(f"🔍 Starting face processing ({'selfie mode' if is_selfie_mode else 'all faces mode'}): {Path(file_path).name}")
         
-        # Read image
-        img = cv2.imread(file_path)
+        # Check if file exists
+        if not os.path.exists(file_path):
+            logger.error(f"❌ File not found: {file_path}")
+            return []
+        
+        # Check file size
+        file_size = os.path.getsize(file_path)
+        logger.info(f"📄 File size: {file_size} bytes")
+        
+        if file_size == 0:
+            logger.error(f"❌ Empty file: {file_path}")
+            return []
+        
+        # Read image as bytes for orientation fixing
+        try:
+            with open(file_path, 'rb') as f:
+                image_data = f.read()
+            logger.info(f"✅ Successfully read {len(image_data)} bytes")
+        except Exception as e:
+            logger.error(f"❌ Failed to read file: {e}")
+            return []
+        
+        # Get smart detector
+        smart_detector = get_smart_face_detector()
+        if smart_detector is None or smart_detector.detector is None:
+            logger.error("❌ SmartFaceDetector not available - trying fallback")
+            return _fallback_face_detection(file_path)
+        
+        logger.info("✅ SmartFaceDetector is ready")
+        
+        # Fix image orientation only for selfie mode, skip for ride photos
+        if is_selfie_mode:
+            try:
+                img, corrected_data = smart_detector.fix_image_orientation(image_data, force_portrait=True)
+                logger.info(f"✅ Orientation fixed, image shape: {img.shape if img is not None else 'None'}")
+            except Exception as e:
+                logger.error(f"❌ Orientation fixing failed: {e}")
+                # Fallback: try to read image directly
+                img = cv2.imread(file_path)
+                if img is not None:
+                    logger.warning("⚠️ Using direct image read as fallback")
+                else:
+                    logger.error(f"❌ Complete image read failure: {file_path}")
+                    return []
+        else:
+            # For ride photos, read directly without orientation fixing
+            img = cv2.imread(file_path)
+            if img is None:
+                logger.error(f"❌ Failed to read image: {file_path}")
+                return []
+            logger.info("✅ Image read directly (skipping orientation fix for ride photos)")
+        
         if img is None:
-            logger.warning(f"❌ Failed to read image: {file_path}")
+            logger.error(f"❌ Failed to read/process image: {file_path}")
             return []
         
-        # Convert BGR to RGB
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w = img_rgb.shape[:2]
+        h, w, c = img.shape
+        logger.info(f"📐 Final image dimensions: {w}x{h}x{c}")
         
-        # Initialize face detector (you may need to adjust this based on your setup)
-        face_detector = get_face_detector()
-        if face_detector is None:
-            logger.warning("❌ Face detector not available")
-            return []
+        # Detect faces with mode-specific filtering
+        faces = None
         
-        # Detect faces
-        faces = detect_faces_with_detector(face_detector, img_rgb)
-        if not faces:
-            logger.debug(f"❌ No faces detected in: {Path(file_path).name}")
+        if is_selfie_mode:
+            # Use smart filtering for selfies
+            logger.info("🎯 Using selfie-optimized detection")
+            faces = smart_detector.detect_and_filter_faces(img, is_reference=True)
+        else:
+            # Detect ALL faces for ride photos (no selfie filtering)
+            logger.info("🎠 Using all-faces detection for ride photos")
+            faces = smart_detector.detect_and_filter_faces(img, is_reference=False)
+        
+        # Fix: Check faces properly (could be numpy array or list)
+        if faces is None or len(faces) == 0:
+            detection_attempts = [
+                {"threshold": 0.5, "description": "Lower threshold"}, 
+                {"threshold": 0.4, "description": "Very low threshold"},
+                {"threshold": 0.3, "description": "Minimal threshold"},
+            ]
+            
+            for attempt in detection_attempts:
+                try:
+                    logger.info(f"🔍 Retry with {attempt['description']} (threshold: {attempt['threshold']})")
+                    
+                    # Temporarily adjust detector threshold
+                    original_threshold = smart_detector.detector.getScoreThreshold()
+                    smart_detector.detector.setScoreThreshold(attempt['threshold'])
+                    
+                    # Try raw detection without any filtering
+                    h, w = img.shape[:2]
+                    smart_detector.detector.setInputSize((w, h))
+                    _, raw_faces = smart_detector.detector.detect(img)
+                    
+                    # Restore original threshold
+                    smart_detector.detector.setScoreThreshold(original_threshold)
+                    
+                    if raw_faces is not None and len(raw_faces) > 0:
+                        logger.info(f"✅ Found {len(raw_faces)} faces with {attempt['description']}")
+                        faces = raw_faces
+                        break
+                    else:
+                        logger.warning(f"⚠️ No faces found with {attempt['description']}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Detection attempt failed: {e}")
+                    continue
+        
+        # Final check with proper numpy array handling
+        if faces is None or (hasattr(faces, '__len__') and len(faces) == 0):
+            logger.error(f"❌ No faces detected in: {Path(file_path).name}")
+            logger.error("🔧 Debugging suggestions:")
+            logger.error("   1. Check if image contains clear, visible faces")
+            logger.error("   2. Verify faces are not too small (< 30px)")
+            logger.error("   3. Try with different lighting/contrast")
+            logger.error("   4. For ride photos, faces might be small or at angles")
             return []
         
         logger.info(f"✅ Found {len(faces)} faces in: {Path(file_path).name}")
@@ -110,21 +518,36 @@ def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
         results = []
         for i, face in enumerate(faces):
             try:
-                x, y, w_box, h_box, confidence = face
+                x, y, w_box, h_box, confidence = face[:5]
+                
+                logger.debug(f"Processing face {i}: x={x:.1f}, y={y:.1f}, w={w_box:.1f}, h={h_box:.1f}, conf={confidence:.3f}")
                 
                 # Validate coordinates
-                x1, y1 = max(x, 0), max(y, 0)
-                x2, y2 = min(x + w_box, w), min(y + h_box, h)
+                x1, y1 = max(int(x), 0), max(int(y), 0)
+                x2, y2 = min(int(x + w_box), w), min(int(y + h_box), h)
                 
                 if x2 <= x1 or y2 <= y1:
-                    logger.warning(f"⚠️ Invalid face bounds for face {i}")
+                    logger.warning(f"⚠️ Invalid face bounds for face {i}: ({x1},{y1}) to ({x2},{y2})")
                     continue
                 
-                # Extract face region
-                face_crop = img_rgb[y1:y2, x1:x2]
+                # Check face size - more lenient for ride photos
+                face_width = x2 - x1
+                face_height = y2 - y1
+                min_size = 20 if not is_selfie_mode else 30  # Smaller minimum for ride photos
+                
+                if face_width < min_size or face_height < min_size:
+                    logger.warning(f"⚠️ Face {i} too small: {face_width}x{face_height}")
+                    continue
+                
+                # Extract face region (convert BGR to RGB for consistency)
+                face_crop_bgr = img[y1:y2, x1:x2]
+                face_crop = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+                
                 if face_crop.size == 0:
                     logger.warning(f"⚠️ Empty face crop for face {i}")
                     continue
+                
+                logger.debug(f"Face {i} crop size: {face_crop.shape}")
                 
                 # Generate embedding
                 embedding = generate_face_embedding(face_crop)
@@ -140,70 +563,74 @@ def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
                 }
                 results.append(result)
                 
-                logger.debug(f"✅ Processed face {i}: bbox={result['bbox']}, conf={confidence:.3f}")
+                
                 
             except Exception as e:
-                logger.warning(f"⚠️ Error processing face {i}: {e}")
+                logger.error(f"❌ Error processing face {i}: {e}")
                 continue
         
-        logger.info(f"✅ Successfully processed {len(results)} faces from: {Path(file_path).name}")
+        logger.info(f"🎯 Final result: {len(results)} faces processed from: {Path(file_path).name}")
         return results
         
     except Exception as e:
-        logger.error(f"❌ Face processing error for {file_path}: {e}")
+        logger.error(f"❌ SmartFaceDetector processing error for {file_path}: {e}")
+        logger.error(f"❌ Error details: {type(e).__name__}: {str(e)}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return []
 
-def get_face_detector():
-    """Get or initialize face detector"""
+def _fallback_face_detection(file_path: str) -> List[Dict[str, Any]]:
+    """Fallback face detection using basic OpenCV methods"""
     try:
-        # Try to get YuNet detector (adjust path as needed)
-        model_path = "models/face_detection_yunet_2023mar.onnx"
-        if os.path.exists(model_path):
-            detector = cv2.FaceDetectorYN.create(
-                model=model_path,
-                config="",
-                input_size=(320, 320),
-                score_threshold=0.7,
-                nms_threshold=0.3,
-                top_k=50
-            )
-            return detector
-        else:
-            logger.warning(f"⚠️ YuNet model not found at: {model_path}")
-            return None
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize face detector: {e}")
-        return None
-
-def detect_faces_with_detector(detector, img_rgb):
-    """Detect faces using the provided detector"""
-    try:
-        h, w = img_rgb.shape[:2]
+        logger.warning("🔄 Using fallback face detection")
         
-        # Set input size
-        detector.setInputSize((w, h))
+        # Try basic OpenCV cascade
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
-        # Detect faces
-        _, faces = detector.detect(img_rgb)
-        
-        if faces is None or len(faces) == 0:
+        # Read image
+        img = cv2.imread(file_path)
+        if img is None:
             return []
         
-        # Format faces
-        formatted_faces = []
-        for face in faces:
-            if len(face) >= 15:  # YuNet returns 15 values
-                x, y, w, h = face[:4]
-                confidence = face[14]
-                
-                # Basic validation
-                if confidence >= 0.7 and w > 30 and h > 30:
-                    formatted_faces.append([int(x), int(y), int(w), int(h), float(confidence)])
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        return formatted_faces
+        # Detect faces
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        logger.info(f"🔄 Fallback detected {len(faces)} faces")
+        
+        results = []
+        for i, (x, y, w, h) in enumerate(faces):
+            try:
+                # Extract face for embedding
+                face_crop = img[y:y+h, x:x+w]
+                face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                
+                # Generate embedding
+                embedding = generate_face_embedding(face_crop_rgb)
+                if embedding is None:
+                    continue
+                
+                result = {
+                    'embedding': embedding.tolist(),
+                    'bbox': {'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h)},
+                    'confidence': 0.8  # Default confidence for cascade
+                }
+                results.append(result)
+                
+            except Exception as e:
+                logger.error(f"❌ Fallback processing error for face {i}: {e}")
+                continue
+        
+        return results
         
     except Exception as e:
-        logger.error(f"❌ Face detection error: {e}")
+        logger.error(f"❌ Fallback detection failed: {e}")
         return []
 
 def generate_face_embedding(face_crop):
@@ -802,8 +1229,8 @@ class OptimizedBatchFaceEmbeddingWorker(QRunnable):
                     filename = Path(file_path).name
                     self.signals.progress.emit(file_path, f"🔍 Processing faces...")
                     
-                    # Process faces in image
-                    faces = process_faces_in_image_optimized(file_path)
+                    # Process faces in image (use ride mode, not selfie mode)
+                    faces = process_faces_in_image_optimized(file_path, is_selfie_mode=False)
                     
                     if not faces:
                         processing_errors += 1
@@ -1004,8 +1431,8 @@ def process_batch_faces_and_upload_optimized(files_list: List[str],
         
         for file_path in files_list:
             try:
-                # Process faces in image
-                faces = process_faces_in_image_optimized(file_path)
+                # Process faces in image (use ride mode for attraction photos)
+                faces = process_faces_in_image_optimized(file_path, is_selfie_mode=False)
                 
                 if not faces:
                     processing_errors += 1
@@ -1076,52 +1503,3 @@ def process_batch_faces_and_upload_optimized(files_list: List[str],
         logger.error(f"❌ Batch processing error: {e}")
         return False, f"Batch processing failed: {str(e)}"
 
-# ===== EXAMPLE USAGE =====
-
-if __name__ == "__main__":
-    """Example usage and testing"""
-    
-    # Test face processing
-    test_image = "/path/to/test/image.jpg"
-    if os.path.exists(test_image):
-        faces = process_faces_in_image_optimized(test_image)
-        print(f"Detected {len(faces)} faces in test image")
-        for i, face in enumerate(faces):
-            print(f"  Face {i}: bbox={face['bbox']}, confidence={face['confidence']:.3f}")
-    
-    # Test separated upload
-    photos_data = [
-        {
-            'file_path': '/path/to/photo1.jpg',
-            'unit_id': 'unit-code-1',
-            'outlet_id': 'outlet-code-1',
-            'photo_type_id': 'type-code-1',
-            'faces_data': [
-                {
-                    'embedding': [0.1] * 512,
-                    'bbox': {'x': 100, 'y': 100, 'w': 50, 'h': 50},
-                    'confidence': 0.95
-                }
-            ]
-        }
-    ]
-    
-    def progress_callback(message: str, current: int, total: int):
-        print(f"Progress: {message} ({current}/{total})")
-    
-    # Test with manager
-    manager = FaceRecognitionUploadManager(API_BASE)
-    results = manager.upload_photos_sync(photos_data, progress_callback)
-    
-    for result in results:
-        if result.success:
-            print(f"✅ Upload successful: {result.original_url}")
-        else:
-            print(f"❌ Upload failed: {result.error_message}")
-    
-    # Test compatibility function
-    files_list = ['/path/to/photo1.jpg']
-    allowed_paths = ['/allowed/base/path']
-    
-    success, message = process_batch_faces_and_upload_optimized(files_list, allowed_paths)
-    print(f"Compatibility test: {success} - {message}")
