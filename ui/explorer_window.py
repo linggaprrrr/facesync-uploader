@@ -212,34 +212,34 @@ class ExplorerWindow(QMainWindow):
   
         
         # Batch settings
-        batch_group = QGroupBox("📦 BATCH SETTINGS")
-        batch_layout = QHBoxLayout()
+        # batch_group = QGroupBox("📦 BATCH SETTINGS")
+        # batch_layout = QHBoxLayout()
         
-        self.batch_upload_cb = QCheckBox("Batch Upload")
-        self.batch_upload_cb.setChecked(True)
-        self.batch_upload_cb.stateChanged.connect(self._on_batch_upload_changed)
-        batch_layout.addWidget(self.batch_upload_cb)
+        # self.batch_upload_cb = QCheckBox("Batch Upload")
+        # self.batch_upload_cb.setChecked(True)
+        # self.batch_upload_cb.stateChanged.connect(self._on_batch_upload_changed)
+        # batch_layout.addWidget(self.batch_upload_cb)
         
-        batch_layout.addWidget(QLabel("Size:"))
-        self.batch_size_spin = QSpinBox()
-        self.batch_size_spin.setRange(1, 100)
-        self.batch_size_spin.setValue(self.batch_size)
-        self.batch_size_spin.valueChanged.connect(self._on_batch_size_changed)
-        batch_layout.addWidget(self.batch_size_spin)
+        # batch_layout.addWidget(QLabel("Size:"))
+        # self.batch_size_spin = QSpinBox()
+        # self.batch_size_spin.setRange(1, 100)
+        # self.batch_size_spin.setValue(self.batch_size)
+        # self.batch_size_spin.valueChanged.connect(self._on_batch_size_changed)
+        # batch_layout.addWidget(self.batch_size_spin)
         
-        batch_layout.addWidget(QLabel("Timeout:"))
-        self.batch_timeout_spin = QSpinBox()
-        self.batch_timeout_spin.setRange(0, 60)
-        self.batch_timeout_spin.setValue(int(self.batch_timeout))
-        self.batch_timeout_spin.setSuffix("s")
-        self.batch_timeout_spin.valueChanged.connect(self._on_batch_timeout_changed)
-        batch_layout.addWidget(self.batch_timeout_spin)
+        # batch_layout.addWidget(QLabel("Timeout:"))
+        # self.batch_timeout_spin = QSpinBox()
+        # self.batch_timeout_spin.setRange(0, 60)
+        # self.batch_timeout_spin.setValue(int(self.batch_timeout))
+        # self.batch_timeout_spin.setSuffix("s")
+        # self.batch_timeout_spin.valueChanged.connect(self._on_batch_timeout_changed)
+        # batch_layout.addWidget(self.batch_timeout_spin)
         
         # Force send button
         
         
-        batch_layout.addStretch()
-        batch_group.setLayout(batch_layout)
+        # batch_layout.addStretch()
+        # batch_group.setLayout(batch_layout)
         
         # Performance metrics
         metrics_group = QGroupBox("📊 REAL-TIME METRICS")
@@ -287,7 +287,7 @@ class ExplorerWindow(QMainWindow):
         # Add all to main layout
         layout.addLayout(path_layout)
         # layout.addWidget(perf_group)
-        layout.addWidget(batch_group)
+        # layout.addWidget(batch_group)
         layout.addWidget(metrics_group)
         layout.addWidget(progress_group)
         

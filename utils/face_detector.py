@@ -44,6 +44,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+
+def _process_large_batch_with_parallel_upload(files_data_list: List[Dict[str, Any]], 
+                                            db_session=None, 
+                                            max_retries: int = 2,
+                                            max_batch_size: int = 5,
+                                            max_concurrent_uploads: int = 5) -> Tuple[bool, str]:
+    """Process large batch with TRUE PARALLEL uploads"""
+    
+    total_files = len(files_data_list)
+    num_batches = (total_files + max_batch_size - 1) // max_batch_size
+    
+    logger.info(f"🚀 PARALLEL upload: {total_files} files in {num_batches} batches with {max_concurrent_uploads} concurrent uploads")
+    
+    # Split into batches
+    batches = []
+    for batch_num in range(num_batches):
+        start_idx = batch_num * max_batch_size
+        end_idx = min(start_idx + max_batch_size, total_files)
+        batch_chunk = files_data_list[start_idx:end_idx]
+        batches.append((batch_num + 1, batch_chunk))
+    
+    # Use ThreadPoolExecutor for parallel uploads
+    successful_uploads = 0
+    failed_uploads = 0
+    failed_batches = []
+    
+    with ThreadPoolExecutor(max_workers=max_concurrent_uploads) as executor:
+        # Submit all batches for parallel processing
+        future_to_batch = {
+            executor.submit(_process_single_batch_wrapper, batch_data, db_session, max_retries): batch_num
+            for batch_num, batch_data in batches
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_batch):
+            batch_num = future_to_batch[future]
+            batch_data = batches[batch_num - 1][1]  # Get the actual batch data
+            
+            try:
+                success, message = future.result()
+                
+                if success:
+                    successful_uploads += len(batch_data)
+                    logger.info(f"✅ Parallel batch {batch_num} completed: {len(batch_data)} files")
+                else:
+                    failed_uploads += len(batch_data)
+                    failed_batches.append(batch_num)
+                    logger.error(f"❌ Parallel batch {batch_num} failed: {message}")
+                    
+            except Exception as e:
+                failed_uploads += len(batch_data)
+                failed_batches.append(batch_num)
+                logger.error(f"❌ Parallel batch {batch_num} error: {e}")
+    
+    # Summary
+    success_rate = (successful_uploads / total_files) * 100 if total_files > 0 else 0
+    
+    if failed_batches:
+        message = f"Parallel upload: {successful_uploads}/{total_files} successful ({success_rate:.1f}%). Failed batches: {failed_batches}"
+        logger.warning(f"⚠️ {message}")
+        return successful_uploads > 0, message
+    else:
+        message = f"Parallel upload: {successful_uploads}/{total_files} successful (100%)"
+        logger.info(f"✅ {message}")
+        return True, message
+
+def _process_single_batch_wrapper(batch_chunk: List[Dict[str, Any]], 
+                                 db_session=None, 
+                                 max_retries: int = 2) -> Tuple[bool, str]:
+    """Wrapper for single batch processing in threads"""
+    return _process_single_batch(batch_chunk, db_session, max_retries)
+
+
 # ===== PERFORMANCE OPTIMIZATIONS =====
 
 @dataclass
@@ -330,71 +404,212 @@ class HighPerformanceYuNetDetector:
     
     @performance_monitor
     def detect_with_optimization(self, img: np.ndarray) -> Optional[List[List[float]]]:
-        """Optimized detection with intelligent resizing and validation"""
+        """Optimized detection with comprehensive input validation"""
         try:
+            # ✅ COMPREHENSIVE INPUT VALIDATION
+            if img is None:
+                logger.error("❌ Image is None")
+                return None
+                
+            if not isinstance(img, np.ndarray):
+                logger.error("❌ Image is not numpy array")
+                return None
+                
+            if img.size == 0:
+                logger.error("❌ Image is empty")
+                return None
+                
+            if len(img.shape) != 3 or img.shape[2] != 3:
+                logger.error(f"❌ Invalid image shape: {img.shape}")
+                return None
+                
+            # Check for invalid values
+            if np.any(np.isnan(img)) or np.any(np.isinf(img)):
+                logger.error("❌ Image contains NaN or infinity values")
+                return None
+                
+            # Ensure proper data type
+            if img.dtype != np.uint8:
+                logger.warning(f"⚠️ Converting image from {img.dtype} to uint8")
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            
             original_h, original_w = img.shape[:2]
             
-            # Smart resizing logic
-            if max(original_w, original_h) > self.config.max_size:
-                scale = self.config.max_size / max(original_w, original_h)
-                new_w = int(original_w * scale)
-                new_h = int(original_h * scale)
+            # Validate dimensions
+            if original_w <= 0 or original_h <= 0:
+                logger.error(f"❌ Invalid dimensions: {original_w}x{original_h}")
+                return None
                 
-                # Use INTER_AREA for downscaling (better quality)
-                resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                
-                # Set input size and detect
-                self.detector.setInputSize((new_w, new_h))
-                _, faces = self.detector.detect(resized_img)
-                
-                # Scale coordinates back with improved precision
-                if faces is not None and len(faces) > 0:
-                    return self._scale_faces_back(faces, scale)
-                else:
-                    return None
-            else:
-                # Direct detection for smaller images
-                self.detector.setInputSize((original_w, original_h))
-                _, faces = self.detector.detect(img)
-                
-                if faces is not None and len(faces) > 0:
-                    return self._format_faces(faces)
-                else:
-                    return None
+            if original_w > 10000 or original_h > 10000:
+                logger.error(f"❌ Image too large: {original_w}x{original_h}")
+                return None
+            
+            # ✅ SAFE DETECTION WITH TRY-CATCH
+            try:
+                # Smart resizing logic
+                if max(original_w, original_h) > self.config.max_size:
+                    scale = self.config.max_size / max(original_w, original_h)
+                    new_w = max(32, int(original_w * scale))  # Ensure minimum size
+                    new_h = max(32, int(original_h * scale))
                     
+                    # Validate new dimensions
+                    if new_w <= 0 or new_h <= 0:
+                        logger.error(f"❌ Invalid resize dimensions: {new_w}x{new_h}")
+                        return None
+                    
+                    # Use INTER_AREA for downscaling (better quality)
+                    resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    
+                    # Validate resized image
+                    if resized_img is None or resized_img.size == 0:
+                        logger.error("❌ Resize operation failed")
+                        return None
+                    
+                    # Set input size with validation
+                    try:
+                        self.detector.setInputSize((new_w, new_h))
+                    except Exception as e:
+                        logger.error(f"❌ setInputSize failed: {e}")
+                        return None
+                    
+                    # Detect with error handling
+                    try:
+                        _, faces = self.detector.detect(resized_img)
+                    except Exception as e:
+                        logger.error(f"❌ Detection failed on resized image: {e}")
+                        return None
+                    
+                    # Scale coordinates back with improved precision
+                    if faces is not None and len(faces) > 0:
+                        return self._scale_faces_back_safe(faces, scale)
+                    else:
+                        return None
+                else:
+                    # Direct detection for smaller images
+                    try:
+                        self.detector.setInputSize((original_w, original_h))
+                    except Exception as e:
+                        logger.error(f"❌ setInputSize failed for original: {e}")
+                        return None
+                        
+                    try:
+                        _, faces = self.detector.detect(img)
+                    except Exception as e:
+                        logger.error(f"❌ Detection failed on original image: {e}")
+                        return None
+                    
+                    if faces is not None and len(faces) > 0:
+                        return self._format_faces_safe(faces)
+                    else:
+                        return None
+                        
+            except cv2.error as e:
+                logger.error(f"❌ OpenCV error during detection: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"❌ Unexpected error during detection: {e}")
+                return None
+                
         except Exception as e:
             logger.error(f"❌ Detection error: {e}")
             return None
     
-    def _scale_faces_back(self, faces: np.ndarray, scale: float) -> List[List[float]]:
-        """Scale face coordinates back to original size with validation"""
-        scaled_faces = []
-        inv_scale = 1.0 / scale
-        
-        for face in faces:
-            x, y, w, h = face[:4]
-            conf = face[14]
+    def _scale_faces_back_safe(self, faces: np.ndarray, scale: float) -> List[List[float]]:
+        """Scale face coordinates back to original size with comprehensive validation"""
+        try:
+            if faces is None or len(faces) == 0:
+                return []
+                
+            scaled_faces = []
+            inv_scale = 1.0 / scale
             
-            # Scale back with rounding
-            orig_x = int(round(x * inv_scale))
-            orig_y = int(round(y * inv_scale))
-            orig_w = int(round(w * inv_scale))
-            orig_h = int(round(h * inv_scale))
+            # Validate scale values
+            if not np.isfinite(inv_scale) or inv_scale <= 0:
+                logger.error(f"❌ Invalid inverse scale: {inv_scale}")
+                return []
             
-            scaled_faces.append([orig_x, orig_y, orig_w, orig_h, float(conf)])
-        
-        return scaled_faces
+            for i, face in enumerate(faces):
+                try:
+                    if len(face) < 15:  # YuNet returns 15 values
+                        logger.warning(f"⚠️ Incomplete face data at index {i}")
+                        continue
+                        
+                    x, y, w, h = face[:4]
+                    conf = face[14]
+                    
+                    # Check for invalid values
+                    if not all(np.isfinite([x, y, w, h, conf])):
+                        logger.warning(f"⚠️ Invalid face values at index {i}")
+                        continue
+                    
+                    # Scale back with safe rounding
+                    orig_x = max(0, int(round(x * inv_scale)))
+                    orig_y = max(0, int(round(y * inv_scale)))
+                    orig_w = max(1, int(round(w * inv_scale)))
+                    orig_h = max(1, int(round(h * inv_scale)))
+                    
+                    # Validate confidence
+                    if not (0.0 <= conf <= 1.0):
+                        logger.warning(f"⚠️ Invalid confidence at index {i}: {conf}")
+                        continue
+                    
+                    scaled_faces.append([orig_x, orig_y, orig_w, orig_h, float(conf)])
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Error processing face {i}: {e}")
+                    continue
+            
+            return scaled_faces
+            
+        except Exception as e:
+            logger.error(f"❌ Error in _scale_faces_back_safe: {e}")
+            return []
     
-    def _format_faces(self, faces: np.ndarray) -> List[List[float]]:
-        """Format faces to standard format [x, y, w, h, conf]"""
-        formatted_faces = []
-        
-        for face in faces:
-            x, y, w, h = face[:4]
-            conf = face[14]
-            formatted_faces.append([int(x), int(y), int(w), int(h), float(conf)])
-        
-        return formatted_faces
+    def _format_faces_safe(self, faces: np.ndarray) -> List[List[float]]:
+        """Format faces to standard format with comprehensive validation"""
+        try:
+            if faces is None or len(faces) == 0:
+                return []
+                
+            formatted_faces = []
+            
+            for i, face in enumerate(faces):
+                try:
+                    if len(face) < 15:  # YuNet returns 15 values
+                        logger.warning(f"⚠️ Incomplete face data at index {i}")
+                        continue
+                        
+                    x, y, w, h = face[:4]
+                    conf = face[14]
+                    
+                    # Check for invalid values
+                    if not all(np.isfinite([x, y, w, h, conf])):
+                        logger.warning(f"⚠️ Invalid face values at index {i}")
+                        continue
+                    
+                    # Convert to safe integers
+                    x_int = max(0, int(round(x)))
+                    y_int = max(0, int(round(y)))
+                    w_int = max(1, int(round(w)))
+                    h_int = max(1, int(round(h)))
+                    
+                    # Validate confidence
+                    if not (0.0 <= conf <= 1.0):
+                        logger.warning(f"⚠️ Invalid confidence at index {i}: {conf}")
+                        continue
+                    
+                    formatted_faces.append([x_int, y_int, w_int, h_int, float(conf)])
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Error formatting face {i}: {e}")
+                    continue
+            
+            return formatted_faces
+            
+        except Exception as e:
+            logger.error(f"❌ Error in _format_faces_safe: {e}")
+            return []
+
     
     @performance_monitor
     def detect_and_validate(self, img: np.ndarray) -> Tuple[bool, Optional[List[List[float]]]]:
@@ -571,12 +786,25 @@ def process_faces_in_image_optimized(file_path: str) -> List[Dict[str, Any]]:
             logger.warning(f"❌ Failed to read image: {file_path}")
             return []
 
+        # Additional image validation
+        if img.size == 0:
+            logger.warning(f"❌ Empty image: {file_path}")
+            return []
+            
+        if len(img.shape) != 3 or img.shape[2] != 3:
+            logger.warning(f"❌ Invalid image format: {img.shape} - {file_path}")
+            return []
+
         h, w = img.shape[:2]
         logger.debug(f"📸 Processing {w}x{h} image: {Path(file_path).name}")
 
-        # Get detector and detect faces
-        detector = get_optimized_detector()
-        success, faces = detector.detect_and_validate(img)
+        # Get detector and detect faces with enhanced error handling
+        try:
+            detector = get_optimized_detector()
+            success, faces = detector.detect_and_validate(img)
+        except Exception as e:
+            logger.error(f"❌ Detection failed for {file_path}: {e}")
+            return []
 
         if not success or not faces:
             logger.debug(f"❌ No faces detected in: {Path(file_path).name}")
@@ -726,27 +954,175 @@ network_client = OptimizedNetworkClient()
 @performance_monitor
 def batch_upload_to_backend_optimized(files_data_list: List[Dict[str, Any]], 
                                     db_session=None, 
-                                    max_retries: int = 3,
-                                    max_batch_size: int = 15):  # CHANGED from 50 to 15
-    """Ultra-optimized batch upload with smaller, faster batches"""
+                                    max_retries: int = 2,
+                                    max_batch_size: int = 15,
+                                    enable_parallel_upload: bool = True,
+                                    max_concurrent_uploads: int = 3):
+    """Ultra-optimized batch upload with TRUE parallel option"""
     
     if not files_data_list:
         logger.error("❌ No files to upload")
         return False, "No files provided"
     
     total_files = len(files_data_list)
-    logger.info(f"🚀 Starting optimized batch upload: {total_files} files")
+    logger.info(f"🚀 Starting optimized batch upload: {total_files} files (parallel: {enable_parallel_upload})")
     
-    # CHANGED: Use smaller batch size for faster uploads
     if total_files > max_batch_size:
         logger.info(f"📦 Splitting {total_files} files into batches of {max_batch_size}")
-        return _process_large_batch_with_splitting(files_data_list, db_session, max_retries, max_batch_size)
+        
+        if enable_parallel_upload:
+            # Use NEW parallel upload
+            return _process_large_batch_with_parallel_upload(
+                files_data_list, db_session, max_retries, max_batch_size, max_concurrent_uploads
+            )
+        else:
+            # Use old sequential upload
+            return _process_large_batch_with_splitting(
+                files_data_list, db_session, max_retries, max_batch_size
+            )
     
     return _process_single_batch(files_data_list, db_session, max_retries)
 
+class AsyncUploadClient:
+    """Async HTTP client for parallel uploads"""
+    
+    def __init__(self, max_concurrent: int = 3):
+        self.max_concurrent = max_concurrent
+        self.semaphore = None
+        self.session = None
+    
+    async def __aenter__(self):
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=60)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def upload_batch_async(self, batch_data: List[Dict[str, Any]], batch_num: int) -> Tuple[bool, str]:
+        """Upload single batch asynchronously"""
+        async with self.semaphore:
+            try:
+                url = f"{API_BASE}/faces/batch-upload-embedding-turbo"
+                
+                # Prepare multipart data
+                data = aiohttp.FormData()
+                
+                # Add files
+                for file_data in batch_data:
+                    file_path = file_data['file_path']
+                    filename = Path(file_path).name
+                    
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                        data.add_field('files', file_content, filename=filename, content_type='image/jpeg')
+                
+                # Add form fields
+                for file_data in batch_data:
+                    data.add_field('unit_codes', file_data['unit_code'])
+                    data.add_field('photo_type_codes', file_data['photo_type_code'])
+                    data.add_field('outlet_codes', file_data['outlet_code'])
+                    
+                    faces_json = json.dumps(file_data['faces'], separators=(',', ':'))
+                    data.add_field('faces_data', faces_json)
+                
+                logger.info(f"🚀 Async uploading batch {batch_num}: {len(batch_data)} files")
+                
+                async with self.session.post(url, data=data) as response:
+                    if response.status in [200, 207]:
+                        result = await response.json()
+                        successful = result.get('successful_uploads', 0)
+                        message = f"Batch {batch_num}: {successful}/{len(batch_data)} successful"
+                        logger.info(f"✅ {message}")
+                        return True, message
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"❌ Batch {batch_num} failed: {response.status}")
+                        return False, f"HTTP {response.status}: {error_text[:100]}"
+                        
+            except Exception as e:
+                logger.error(f"❌ Async upload error for batch {batch_num}: {e}")
+                return False, str(e)
+
+async def _process_large_batch_with_async_upload(files_data_list: List[Dict[str, Any]], 
+                                               max_batch_size: int = 15,
+                                               max_concurrent_uploads: int = 3) -> Tuple[bool, str]:
+    """Process large batch with async parallel uploads"""
+    
+    total_files = len(files_data_list)
+    num_batches = (total_files + max_batch_size - 1) // max_batch_size
+    
+    logger.info(f"🚀 ASYNC PARALLEL upload: {total_files} files in {num_batches} batches")
+    
+    # Split into batches
+    batches = []
+    for batch_num in range(num_batches):
+        start_idx = batch_num * max_batch_size
+        end_idx = min(start_idx + max_batch_size, total_files)
+        batch_chunk = files_data_list[start_idx:end_idx]
+        batches.append((batch_num + 1, batch_chunk))
+    
+    successful_uploads = 0
+    failed_uploads = 0
+    failed_batches = []
+    
+    async with AsyncUploadClient(max_concurrent_uploads) as client:
+        # Create tasks for all batches
+        tasks = [
+            client.upload_batch_async(batch_data, batch_num)
+            for batch_num, batch_data in batches
+        ]
+        
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for i, result in enumerate(results):
+            batch_num, batch_data = batches[i]
+            
+            if isinstance(result, Exception):
+                failed_uploads += len(batch_data)
+                failed_batches.append(batch_num)
+                logger.error(f"❌ Async batch {batch_num} exception: {result}")
+            else:
+                success, message = result
+                if success:
+                    successful_uploads += len(batch_data)
+                else:
+                    failed_uploads += len(batch_data)
+                    failed_batches.append(batch_num)
+    
+    # Summary
+    success_rate = (successful_uploads / total_files) * 100 if total_files > 0 else 0
+    
+    if failed_batches:
+        message = f"Async parallel upload: {successful_uploads}/{total_files} successful ({success_rate:.1f}%)"
+        return successful_uploads > 0, message
+    else:
+        message = f"Async parallel upload: {successful_uploads}/{total_files} successful (100%)"
+        return True, message
+
+def run_async_upload(files_data_list: List[Dict[str, Any]], 
+                    max_batch_size: int = 15,
+                    max_concurrent_uploads: int = 3) -> Tuple[bool, str]:
+    """Run async upload in sync context"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(
+        _process_large_batch_with_async_upload(files_data_list, max_batch_size, max_concurrent_uploads)
+    )
+
+
 def _process_large_batch_with_splitting(files_data_list: List[Dict[str, Any]], 
                                       db_session=None, 
-                                      max_retries: int = 3,
+                                      max_retries: int = 2,
                                       max_batch_size: int = 50) -> Tuple[bool, str]:
     """Process large batch by splitting into smaller chunks"""
     
@@ -800,7 +1176,7 @@ def _process_large_batch_with_splitting(files_data_list: List[Dict[str, Any]],
 
 def _process_single_batch(files_data_list: List[Dict[str, Any]], 
                          db_session=None, 
-                         max_retries: int = 3) -> Tuple[bool, str]:
+                         max_retries: int = 2) -> Tuple[bool, str]:
     """Process a single batch (≤50 files)"""
     
     batch_size = len(files_data_list)
@@ -813,7 +1189,7 @@ def _process_single_batch(files_data_list: List[Dict[str, Any]],
             return False, "No network connectivity"
         
         session = network_client.get_session()
-        url = f"{API_BASE}/faces/batch-upload-embedding"
+        url = f"{API_BASE}/faces/batch-upload-embedding-turbo"
         
         # Upload attempts with retry
         for attempt in range(max_retries):
@@ -1313,7 +1689,7 @@ class OptimizedBatchFaceEmbeddingWorker(QRunnable):
 
 # ===== LEGACY COMPATIBILITY FUNCTIONS =====
 
-def upload_embedding_to_backend(file_path: str, faces: List[Dict], allowed_paths: List[str], max_retries: int = 3) -> bool:
+def upload_embedding_to_backend(file_path: str, faces: List[Dict], allowed_paths: List[str], max_retries: int = 2) -> bool:
     """Legacy single file upload with optimized backend"""
     try:
         filename = Path(file_path).name
