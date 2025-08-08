@@ -13,3 +13,4 @@ retina-face==0.0.17
 tf-keras>=2.14.0
 sqlalchemy
 psycopg2-binary
+aioboto3

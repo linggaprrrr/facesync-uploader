@@ -10,10 +10,6 @@ from ui.config_manager import ConfigManager
 from ui.explorer_window import ExplorerWindow
 
 # UPDATED: Import your optimized face detection module
-from utils.face_detector import (
-    initialize_optimized_face_detection, 
-    cleanup_optimized_face_detection
-)
 
 import logging
 
@@ -43,27 +39,7 @@ class MainApplication:
         """Initialize all application systems"""
         try:
             logger.info("🚀 Starting FaceSync application initialization...")
-            
-            # STEP 1: Initialize optimized face detection system
-            logger.info("🔧 Initializing face detection system...")
-            if not initialize_optimized_face_detection():
-                logger.error("❌ Failed to initialize face detection system")
-                QMessageBox.critical(
-                    None, 
-                    "Initialization Error", 
-                    "Failed to initialize face detection system!\n\n"
-                    "Please check:\n"
-                    "• Database connection\n"
-                    "• Face detection models\n"
-                    "• System requirements\n\n"
-                    "Application will exit."
-                )
-                return False
-            
-            self.face_detection_initialized = True
-            logger.info("✅ Face detection system initialized successfully")
-            
-            # STEP 2: Additional system initialization can go here
+                       
             # Example: Initialize other components, check licenses, etc.
             
             logger.info("✅ All systems initialized successfully")

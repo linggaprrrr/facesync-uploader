@@ -5,6 +5,8 @@ import os
 import time
 import logging
 from datetime import datetime
+import asyncio
+from typing import List, Dict, Any
 
 from PyQt5.QtWidgets import (
     QMainWindow, QListView, QFileDialog, QTextEdit, QPushButton, 
@@ -17,11 +19,20 @@ from PyQt5.QtGui import QPixmap, QIcon, QFont
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QThreadPool, QRunnable
 import cv2
 import numpy as np
-from utils.face_detector import OptimizedBatchFaceEmbeddingWorker
 from utils.file_queue import TurboFileQueue
+from core.device_setup import API_BASE
 
+# Import separated upload system
+try:
+    from utils.face_detector import process_faces_in_image_optimized
+    from utils.separated_uploader import SeparatedUploadManager, UploadResult
+    print("✅ Imported upload system")
+except ImportError:
+    print("❌ Warning: upload system not found, using fallback")
+    from utils.face_detector import OptimizedBatchFaceEmbeddingWorker
+    SeparatedUploadManager = None
 
-# Import dengan try-except untuk avoid errors
+# Import with try-except to avoid errors
 try:
     from core.watcher import start_watcher, stop_watcher
 except ImportError:
@@ -37,34 +48,179 @@ except ImportError:
     AdminLoginDialog = None
     AdminSettingsDialog = None
 
-# HIGH PERFORMANCE: Import face detection workers
-try:
-    from utils.face_detector import FaceEmbeddingWorker, OptimizedBatchFaceEmbeddingWorker
-    print("✅ Imported workers from utils.face_detector")
-except ImportError:
-    print("❌ Warning: Face detection workers not found")
-    FaceEmbeddingWorker = None
-    OptimizedBatchFaceEmbeddingWorker = None
-
 logger = logging.getLogger(__name__)
 
-class WorkerSignals(QObject):
-    """Worker signals for threading"""
+class SeparatedUploadWorkerSignals(QObject):
+    """Signals for separated upload worker"""
     finished = pyqtSignal(str, bool, str)  # result_summary, success, message
+    progress = pyqtSignal(str, str)  # current_operation, status
     error = pyqtSignal(str, str)  # file_path, error_message
-    progress = pyqtSignal(str, str)  # current_file, status
     batch_completed = pyqtSignal(int, int)  # successful_count, failed_count
+    upload_progress = pyqtSignal(int, int)  # current, total
+
+
+class SeparatedUploadWorker(QRunnable):
+    """Worker that uses the new separated upload system"""
+    
+    def __init__(self, files_list: List[str], allowed_paths: List[str], api_base_url: str = API_BASE):
+        super().__init__()
+        self.files_list = files_list
+        self.allowed_paths = allowed_paths
+        self.api_base_url = api_base_url
+        self.signals = SeparatedUploadWorkerSignals()
+        
+    def run(self):
+        """Run the separated upload process"""
+        try:
+            thread_name = f"Worker-{len(self.files_list)}"
+            logger.info(f"🚀 [{thread_name}] Starting upload: {len(self.files_list)} files")
+            
+            # Progress callback
+            def progress_callback(message: str, current: int, total: int):
+                self.signals.progress.emit(message, f"{current}/{total}")
+                self.signals.upload_progress.emit(current, total)
+            
+            # Process files and extract face data
+            self.signals.progress.emit("Processing faces...", "0/0")
+            photos_data = []
+            processing_errors = 0
+            
+            for i, file_path in enumerate(self.files_list):
+                try:
+                    filename = os.path.basename(file_path)
+                    self.signals.progress.emit(f"Processing {filename}", f"{i+1}/{len(self.files_list)}")
+                    
+                    # Process faces in image
+                    faces = process_faces_in_image_optimized(file_path)
+                    
+                    if not faces:
+                        processing_errors += 1
+                        self.signals.error.emit(file_path, "No faces detected")
+                        continue
+                    
+                    # Parse path codes
+                    relative_path = self._get_relative_path(file_path)
+                    if not relative_path:
+                        processing_errors += 1
+                        self.signals.error.emit(file_path, "Invalid path")
+                        continue
+                    
+                    unit_code, outlet_code, photo_type_code = self._parse_codes_from_path(relative_path)
+                    if not all([unit_code, outlet_code, photo_type_code]):
+                        processing_errors += 1
+                        self.signals.error.emit(file_path, "Path parsing failed")
+                        continue
+                    
+                    # Convert codes to IDs (you'll need to implement this based on your system)
+                    unit_id, outlet_id, photo_type_id = self._resolve_codes_to_ids(
+                        unit_code, outlet_code, photo_type_code
+                    )
+                    
+                    photo_data = {
+                        'file_path': file_path,
+                        'unit_id': unit_id,
+                        'outlet_id': outlet_id,
+                        'photo_type_id': photo_type_id,
+                        'faces_data': faces
+                    }
+                    photos_data.append(photo_data)
+                    
+                except Exception as e:
+                    processing_errors += 1
+                    self.signals.error.emit(file_path, f"Processing error: {str(e)}")
+            
+            if not photos_data:
+                self.signals.finished.emit("No valid photos to upload", False, "All files failed processing")
+                return
+            
+            # Use separated upload manager
+            if SeparatedUploadManager:
+                self.signals.progress.emit("Starting upload...", "0/0")
+                
+                upload_manager = SeparatedUploadManager(self.api_base_url)
+                results = upload_manager.upload_photos_sync(photos_data, progress_callback)
+                
+                # Process results
+                successful = len([r for r in results if r.success])
+                failed = len([r for r in results if not r.success])
+                
+                success_rate = (successful / len(results)) * 100 if results else 0
+                
+                if successful > 0:
+                    message = f"Upload: {successful}/{len(results)} successful ({success_rate:.1f}%)"
+                    self.signals.finished.emit(message, True, message)
+                else:
+                    message = f"Upload failed: 0/{len(results)} successful"
+                    self.signals.finished.emit(message, False, message)
+                
+                self.signals.batch_completed.emit(successful, failed)
+                
+            else:
+                # Fallback to old system
+                self.signals.progress.emit("Using fallback upload...", "0/0")
+                # Implement fallback if needed
+                self.signals.finished.emit("Fallback upload not implemented", False, "SeparatedUploadManager not available")
+                
+        except Exception as e:
+            logger.error(f"❌ upload worker error: {e}")
+            self.signals.error.emit("batch", f"Worker error: {str(e)}")
+            self.signals.finished.emit("Upload failed", False, str(e))
+    
+    def _get_relative_path(self, file_path: str) -> str:
+        """Get relative path from allowed paths"""
+        from pathlib import Path
+        
+        file_path_obj = Path(file_path).resolve()
+        
+        for root in self.allowed_paths:
+            root_path = Path(root).resolve()
+            try:
+                relative = file_path_obj.relative_to(root_path)
+                return str(relative)
+            except ValueError:
+                continue
+        
+        return None
+    
+    def _parse_codes_from_path(self, relative_path: str):
+        """Parse codes from relative path"""
+        from pathlib import Path
+        
+        try:
+            parts = Path(relative_path).parts
+            if len(parts) < 4:
+                return None, None, None
+
+            unit_code = parts[0].split("_")[0]
+            outlet_code = parts[1].split("_")[0]
+            photo_type_code = parts[2].split("_")[0]
+
+            return unit_code, outlet_code, photo_type_code
+        except:
+            return None, None, None
+    
+    def _resolve_codes_to_ids(self, unit_code: str, outlet_code: str, photo_type_code: str):
+        """
+        Convert codes to UUIDs - you'll need to implement this based on your system
+        This could be done via API call or local cache
+        """
+        # TODO: Implement code-to-ID resolution
+        # For now, return the codes as IDs (you'll need proper UUID resolution)
+        return unit_code, outlet_code, photo_type_code
 
 
 class ExplorerWindow(QMainWindow):
-    """HIGH PERFORMANCE Explorer Window"""
+    """Updated Explorer Window with Upload System"""
     
     def __init__(self, config_manager):
         super().__init__()
         self.threadpool = QThreadPool()
         self.config_manager = config_manager
-        self.setWindowTitle("FaceSync - Uploader")
+        self.setWindowTitle("FaceSync - Upload System")
         self.setGeometry(100, 100, 1400, 900)
+        
+        # API Configuration
+        self.api_base_url = API_BASE  # Configure this based on your setup
         
         # File processing
         self.file_queue = TurboFileQueue(self)
@@ -72,47 +228,39 @@ class ExplorerWindow(QMainWindow):
         self.file_queue.file_failed.connect(self._on_file_failed)
         self.file_queue.queue_status.connect(self._on_queue_status_changed)
 
-        # PERFORMANCE MODES
+        # PERFORMANCE MODES - Updated for separated upload
         self.performance_modes = {
             'turbo': {
-                'batch_size': 10,  # Reduce from 25
-                'timeout': 0.5,    # Reduce from 1
+                'batch_size': 5,   # Smaller batches for faster data processing
+                'timeout': 0.5,
                 'validation': 'instant',
-                'concurrent': 10,  # Increase from 5
-                'upload_batch_size': 15,  # Reduce from 20
+                'concurrent': 8,   # More concurrent uploads
+                'description': 'Instant processing with separated uploads'
             },
             'speed': {
-                'batch_size': 25, 'timeout': 1, 'validation': 'fast', 
-                'concurrent': 4, 'upload_batch_size': 30,
-                'description': 'Send every 25 files or 1s'
-            },
-            'fast': {
-                'batch_size': 40, 'timeout': 2, 'validation': 'fast',
-                'concurrent': 3, 'upload_batch_size': 50,
-                'description': 'Send every 40 files or 2s'
+                'batch_size': 15, 'timeout': 1, 'validation': 'fast', 
+                'concurrent': 5,
+                'description': 'Fast processing with separated uploads'
             },
             'balanced': {
-                'batch_size': 50, 'timeout': 3, 'validation': 'balanced',
-                'concurrent': 2, 'upload_batch_size': 50,
-                'description': 'Send every 50 files or 3s'
+                'batch_size': 25, 'timeout': 2, 'validation': 'balanced',
+                'concurrent': 3,
+                'description': 'Balanced processing with separated uploads'
             },
             'stable': {
                 'batch_size': 50, 'timeout': 5, 'validation': 'thorough',
-                'concurrent': 1, 'upload_batch_size': 50,
-                'description': 'Send every 50 files or 5s'
+                'concurrent': 1,
+                'description': 'Stable processing with separated uploads'
             }
         }
         
-        self.current_mode = 'turbo'  # Default to speed mode
+        self.current_mode = 'turbo'  # Default to turbo mode
         self._apply_performance_mode(self.current_mode)
         
         # Batch processing
         self.use_batch_upload = True
         self.batch_queue = []
         self.batch_processing = False
-        
-        # Upload batch size configuration
-        self.upload_batch_size = self.performance_modes[self.current_mode]['upload_batch_size']
         
         # State tracking
         self.failed_files = set()
@@ -142,7 +290,9 @@ class ExplorerWindow(QMainWindow):
         self._start_performance_monitoring()
         
         # Log startup
-        self.log_with_timestamp(f"📦 Batch: {self.batch_size}, Timeout: {self.batch_timeout}s")
+        self.log_with_timestamp(f"🚀 Upload System Ready")
+        self.log_with_timestamp(f"📦 Mode: {self.current_mode.upper()}, Batch: {self.batch_size}, Timeout: {self.batch_timeout}s")
+        self.log_with_timestamp(f"🌐 API: {self.api_base_url}")
 
     def _apply_performance_mode(self, mode):
         """Apply performance mode settings"""
@@ -158,7 +308,7 @@ class ExplorerWindow(QMainWindow):
             self.file_queue.set_max_concurrent(self.max_concurrent)
 
     def _init_ui(self):
-        """Initialize modern UI"""
+        """Initialize modern UI with separated upload indicators"""
         # Create main splitter
         main_splitter = QSplitter(Qt.Vertical)
         
@@ -188,7 +338,7 @@ class ExplorerWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.embedding_label)
 
     def _create_top_section(self):
-        """Create top control section"""
+        """Create top control section with separated upload info"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
@@ -209,49 +359,15 @@ class ExplorerWindow(QMainWindow):
         path_layout.addStretch()
         path_layout.addWidget(self.retry_button)
         path_layout.addWidget(self.admin_button)
-  
         
-        # Batch settings
-        # batch_group = QGroupBox("📦 BATCH SETTINGS")
-        # batch_layout = QHBoxLayout()
-        
-        # self.batch_upload_cb = QCheckBox("Batch Upload")
-        # self.batch_upload_cb.setChecked(True)
-        # self.batch_upload_cb.stateChanged.connect(self._on_batch_upload_changed)
-        # batch_layout.addWidget(self.batch_upload_cb)
-        
-        # batch_layout.addWidget(QLabel("Size:"))
-        # self.batch_size_spin = QSpinBox()
-        # self.batch_size_spin.setRange(1, 100)
-        # self.batch_size_spin.setValue(self.batch_size)
-        # self.batch_size_spin.valueChanged.connect(self._on_batch_size_changed)
-        # batch_layout.addWidget(self.batch_size_spin)
-        
-        # batch_layout.addWidget(QLabel("Timeout:"))
-        # self.batch_timeout_spin = QSpinBox()
-        # self.batch_timeout_spin.setRange(0, 60)
-        # self.batch_timeout_spin.setValue(int(self.batch_timeout))
-        # self.batch_timeout_spin.setSuffix("s")
-        # self.batch_timeout_spin.valueChanged.connect(self._on_batch_timeout_changed)
-        # batch_layout.addWidget(self.batch_timeout_spin)
-        
-        # Force send button
-        
-        
-        # batch_layout.addStretch()
-        # batch_group.setLayout(batch_layout)
-        
+       
         # Performance metrics
-        metrics_group = QGroupBox("📊 REAL-TIME METRICS")
+        metrics_group = QGroupBox("📊 STATUS")
         metrics_layout = QVBoxLayout()
         
-        metrics_row1 = QHBoxLayout()
-        self.processed_label = QLabel("Processed: 0")
-        self.failed_label = QLabel("Failed: 0")
-        self.rate_label = QLabel("Rate: 0.0/min")
-        metrics_row1.addWidget(self.processed_label)
-        metrics_row1.addWidget(self.failed_label)
-        metrics_row1.addWidget(self.rate_label)
+        metrics_row1 = QHBoxLayout()        
+        self.upload_status_label = QLabel("Status: Ready")        
+        metrics_row1.addWidget(self.upload_status_label)
         metrics_row1.addStretch()
         
         metrics_row2 = QHBoxLayout()
@@ -271,7 +387,7 @@ class ExplorerWindow(QMainWindow):
         progress_group = QGroupBox("⚡ PROCESSING STATUS")
         progress_layout = QVBoxLayout()
         
-        self.overall_progress = QLabel("🚀 App is ready")
+        self.overall_progress = QLabel("🚀 Upload System Ready")
         self.overall_progress.setStyleSheet("font-weight: bold; color: #2196F3;")
         progress_layout.addWidget(self.overall_progress)
         
@@ -286,8 +402,7 @@ class ExplorerWindow(QMainWindow):
         
         # Add all to main layout
         layout.addLayout(path_layout)
-        # layout.addWidget(perf_group)
-        # layout.addWidget(batch_group)
+        
         layout.addWidget(metrics_group)
         layout.addWidget(progress_group)
         
@@ -311,7 +426,7 @@ class ExplorerWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         
         log_header = QHBoxLayout()
-        log_label = QLabel("📋 LOGS")
+        log_label = QLabel("📋 UPLOAD LOGS")
         log_label.setStyleSheet("font-weight: bold;")
         
         self.clear_logs_btn = QPushButton("🗑️ Clear")
@@ -356,6 +471,7 @@ class ExplorerWindow(QMainWindow):
         """Update mode description"""
         desc = self.performance_modes[self.current_mode]['description']
         self.mode_desc_label.setText(desc)
+        self.mode_desc_label.setStyleSheet("color: #666; font-style: italic;")
 
     def _on_mode_changed(self, mode):
         """Handle performance mode change"""
@@ -363,12 +479,8 @@ class ExplorerWindow(QMainWindow):
         self._apply_performance_mode(mode)
         self._update_mode_description()
         
-        # Update UI controls
-        self.batch_size_spin.setValue(self.batch_size)
-        self.batch_timeout_spin.setValue(int(self.batch_timeout))
-        
         self.log_with_timestamp(f"🚀 SWITCHED TO {mode.upper()} MODE")
-        self.log_with_timestamp(f"⚡ Settings: Batch={self.batch_size}, Timeout={self.batch_timeout}s, Validation={self.validation_mode}")
+        self.log_with_timestamp(f"⚡ Settings: Batch={self.batch_size}, Timeout={self.batch_timeout}s")
         
         # Process current batch if in turbo mode
         if mode == 'turbo' and self.batch_queue:
@@ -376,7 +488,7 @@ class ExplorerWindow(QMainWindow):
             self._process_batch()
 
     def _on_file_ready(self, file_path):
-        """Handle file ready - IMMEDIATE SENDING when batch is full"""
+        """Handle file ready - using separated upload system"""
         filename = os.path.basename(file_path)
         
         if self.use_batch_upload:
@@ -385,28 +497,33 @@ class ExplorerWindow(QMainWindow):
             
             self.log_with_timestamp(f"⚡ Added to batch: {filename} (queue: {current_batch_size}/{self.batch_size})")
             
-            # IMMEDIATE SENDING LOGIC
+            # SEPARATED UPLOAD LOGIC
             if self.current_mode == 'turbo':
-                # TURBO: Send immediately, no batching
-                self.log_with_timestamp(f"Sending immediately - {filename}")
+                # TURBO: Send immediately
+                self.log_with_timestamp(f"🚀 TURBO: Sending immediately - {filename}")
                 self._process_batch()
                 
             elif current_batch_size >= self.batch_size:
                 # BATCH FULL: Send immediately when batch size reached
-                self.log_with_timestamp(f"📦 BATCH FULL ({self.batch_size} files) - sending immediately!")
+                self.log_with_timestamp(f"📦 BATCH FULL ({self.batch_size} files) - sending with separated upload!")
                 self._process_batch()
                 
             elif self.batch_timeout > 0:
                 # START/RESTART TIMER: Will send when timeout reached
-                self.log_with_timestamp(f"⏱️ Batch timer: will send in {self.batch_timeout}s if no more files")
+                self.log_with_timestamp(f"⏱️ Batch timer: will send in {self.batch_timeout}s")
                 self._set_batch_timer()
         else:
             # Single file processing
-            self.log_with_timestamp(f"🔥 Processing single: {filename}")
-            # TODO: Implement single file processing if needed
+            self.log_with_timestamp(f"🔥 Processing single file: {filename}")
+            self._process_single_file(file_path)
+
+    def _process_single_file(self, file_path):
+        """Process single file with separated upload"""
+        files_list = [file_path]
+        self._start_separated_upload_worker(files_list)
 
     def _set_batch_timer(self):
-        """Set/restart timer for batch timeout - IMMEDIATE SENDING on timeout"""
+        """Set/restart timer for batch timeout"""
         if self.batch_timeout <= 0:
             return  # No timer for instant modes
             
@@ -425,10 +542,10 @@ class ExplorerWindow(QMainWindow):
         self.batch_timer.start(timeout_ms)
 
     def _auto_process_batch(self):
-        """AUTO send batch when timer expires - IMMEDIATE SENDING"""
+        """AUTO send batch when timer expires"""
         if self.batch_queue and not self.batch_processing:
             batch_size = len(self.batch_queue)
-            self.log_with_timestamp(f"⏰ TIMEOUT REACHED - sending {batch_size} files immediately")
+            self.log_with_timestamp(f"⏰ TIMEOUT REACHED - sending {batch_size} files with separated upload")
             self._process_batch()
         else:
             self.log_with_timestamp("⏰ Timer expired but no files to send")
@@ -437,18 +554,14 @@ class ExplorerWindow(QMainWindow):
         """Force send current batch"""
         if self.batch_queue and not self.batch_processing:
             batch_size = len(self.batch_queue)
-            self.log_with_timestamp(f"🚀 FORCE SEND - sending {batch_size} files now")
+            self.log_with_timestamp(f"🚀 FORCE SEND - sending {batch_size} files with separated upload")
             self._process_batch()
         else:
             self.log_with_timestamp("📭 No files to send or already processing")
 
     def _process_batch(self):
-        """Process current batch - IMMEDIATE SENDING with optimal upload batch size"""
+        """Process current batch using separated upload system"""
         if not self.batch_queue or self.batch_processing:
-            return
-        
-        if not OptimizedBatchFaceEmbeddingWorker:
-            self.log_with_timestamp("❌ BatchFaceEmbeddingWorker not available")
             return
         
         # Stop timer since we're processing now
@@ -460,42 +573,64 @@ class ExplorerWindow(QMainWindow):
         self.batch_queue.clear()  # Clear queue immediately for new files
         self.batch_processing = True
         
-        self.log_with_timestamp(f"🚀 SENDING BATCH: {len(batch_files)} files (upload chunks: {self.upload_batch_size})")
+        self.log_with_timestamp(f"🚀 SEPARATED UPLOAD: {len(batch_files)} files")
         
+        # Start separated upload worker
+        self._start_separated_upload_worker(batch_files)
+
+    def _start_separated_upload_worker(self, files_list):
+        """Start the separated upload worker"""
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.overall_progress.setText(f"🚀 Sending {len(batch_files)} files")
+        self.overall_progress.setText(f"🚀 Upload: {len(files_list)} files")
+        self.upload_status_label.setText("Status: Uploading")
+        self.upload_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
         
-        # Create and start worker with optimal upload batch size
-        worker = OptimizedBatchFaceEmbeddingWorker(
-            batch_files, 
-            self.allowed_paths, 
-            max_upload_batch_size=self.upload_batch_size
-        )
-        worker.signals.progress.connect(self._on_batch_progress)
-        worker.signals.finished.connect(self._on_batch_finished)
-        worker.signals.error.connect(self._on_batch_error)
-        worker.signals.batch_completed.connect(self._on_batch_completed)
+        # Create and start worker
+        worker = SeparatedUploadWorker(files_list, self.allowed_paths, self.api_base_url)
+        worker.signals.progress.connect(self._on_separated_upload_progress)
+        worker.signals.finished.connect(self._on_separated_upload_finished)
+        worker.signals.error.connect(self._on_separated_upload_error)
+        worker.signals.batch_completed.connect(self._on_separated_upload_completed)
+        worker.signals.upload_progress.connect(self._on_upload_progress)
         self.threadpool.start(worker)
 
-    def _on_batch_progress(self, current_file, status):
-        """Handle batch progress updates"""
-        self.current_operation_label.setText(f"🚀 {status}")
-        if current_file != "batch":
-            filename = os.path.basename(current_file)
-            self.log_with_timestamp(f"🔍 Processing: {filename}")
+    def _on_separated_upload_progress(self, current_operation, status):
+        """Handle separated upload progress updates"""
+        self.current_operation_label.setText(f"🚀 {current_operation}")
+        if status:
+            self.upload_status_label.setText(f"Status: {status}")
 
-    def _on_batch_finished(self, result_summary, success, message):
-        """Handle batch completion - READY FOR NEXT BATCH IMMEDIATELY"""
+    def _on_upload_progress(self, current, total):
+        """Handle upload progress bar updates"""
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+
+    def _on_separated_upload_finished(self, result_summary, success, message):
+        """Handle separated upload completion"""
         self.batch_processing = False
         self.progress_bar.setVisible(False)
         self.overall_progress.setText("🚀 Ready for next batch")
         self.current_operation_label.setText("")
         
-        self.log_with_timestamp(f"✅ Batch sent: {result_summary}")
+        if success:
+            self.upload_status_label.setText("Status: Success")
+            self.upload_status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.log_with_timestamp(f"✅ upload completed: {result_summary}")
+        else:
+            self.upload_status_label.setText("Status: Failed")
+            self.upload_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
+            self.log_with_timestamp(f"❌ upload failed: {message}")
         
-        # IMMEDIATE PROCESSING: Check if new files arrived while processing
+        # Reset status after delay
+        QTimer.singleShot(3000, lambda: (
+            self.upload_status_label.setText("Status: Ready"),
+            self.upload_status_label.setStyleSheet("color: #666;")
+        ))
+        
+        # Check if new files arrived while processing
         if self.batch_queue:
             new_files_count = len(self.batch_queue)
             self.log_with_timestamp(f"📦 Found {new_files_count} new files during upload")
@@ -509,46 +644,44 @@ class ExplorerWindow(QMainWindow):
                 self.log_with_timestamp(f"⏱️ Starting timer for {new_files_count} queued files")
                 self._set_batch_timer()
 
-    def _on_batch_error(self, file_path, error_message):
-        """Handle batch errors"""
-        self.batch_processing = False
+    def _on_separated_upload_error(self, file_path, error_message):
+        """Handle separated upload errors"""
+        filename = os.path.basename(file_path) if file_path != "batch" else "batch"
         self.failed_count += 1
-        self.log_with_timestamp(f"❌ Batch error: {error_message}")
+        self.log_with_timestamp(f"❌ Upload error ({filename}): {error_message}")
 
-    def _on_batch_completed(self, successful_count, failed_count):
-        """Handle batch completion statistics"""
+    def _on_separated_upload_completed(self, successful_count, failed_count):
+        """Handle separated upload completion statistics"""
         total = successful_count + failed_count
         self.processed_count += successful_count
         self.failed_count += failed_count
         self.last_processed_time = time.time()
         
-        self.log_with_timestamp(f"📊 Stats: {successful_count}/{total} successful, {failed_count} failed")
+        self.log_with_timestamp(f"📊 Upload stats: {successful_count}/{total} successful, {failed_count} failed")
 
     def _on_queue_status_changed(self, queue_size, processing_count):
         """Handle queue status changes"""
         self.update_embedding_status()
 
     def _update_performance_metrics(self):
-        """Update performance metrics display with immediate sending info"""
+        """Update performance metrics display"""
         elapsed = time.time() - self.start_time
         rate = (self.processed_count * 60) / elapsed if elapsed > 0 else 0
         
-        self.processed_label.setText(f"Processed: {self.processed_count}")
-        self.failed_label.setText(f"Failed: {self.failed_count}")
-        self.rate_label.setText(f"Rate: {rate:.1f}/min")
+        
         
         queue_size = self.file_queue.get_queue_size()
-        processing = self.file_queue.get_processing_count()
+        
         batch_size = len(self.batch_queue)
         
         self.queue_label.setText(f"Queue: {queue_size}")
-        self.processing_label.setText(f"Processing: {processing}")
         
-        # Show batch queue with immediate sending info
+        
+        # Show batch queue with separated upload info
         if batch_size > 0:
             remaining_for_batch = max(0, self.batch_size - batch_size)
             if remaining_for_batch == 0:
-                self.batch_queue_label.setText(f"Batch: {batch_size} (READY TO SEND)")
+                self.batch_queue_label.setText(f"Batch: {batch_size} (READY FOR SEPARATED UPLOAD)")
                 self.batch_queue_label.setStyleSheet("color: #FF5722; font-weight: bold;")
             else:
                 self.batch_queue_label.setText(f"Batch: {batch_size}/{self.batch_size} (need {remaining_for_batch} more)")
@@ -556,46 +689,6 @@ class ExplorerWindow(QMainWindow):
         else:
             self.batch_queue_label.setText("Batch: Empty")
             self.batch_queue_label.setStyleSheet("color: #666;")
-
-    def _on_batch_upload_changed(self, state):
-        """Handle batch upload toggle with immediate sending explanation"""
-        self.use_batch_upload = state == 2
-        
-        if self.use_batch_upload:
-            mode_text = f"BATCH MODE (send every {self.batch_size} files)"
-            # Process current batch if switching to batch mode
-            if self.batch_queue:
-                self.log_with_timestamp("🔄 Switching to batch mode - sending current queue")
-                self._process_batch()
-        else:
-            mode_text = "SINGLE MODE (send immediately)"
-        
-        self.log_with_timestamp(f"⚡ Processing mode: {mode_text}")
-
-    def _on_batch_size_changed(self, value):
-        """Handle batch size change - IMMEDIATE EFFECT"""
-        old_batch_size = self.batch_size
-        self.batch_size = value
-        current_queue_size = len(self.batch_queue)
-        
-        self.log_with_timestamp(f"📦 Batch size changed: {old_batch_size} → {value}")
-        
-        # If current queue >= new batch size, send immediately
-        if current_queue_size >= self.batch_size and not self.batch_processing:
-            self.log_with_timestamp(f"📦 Current queue ({current_queue_size}) ≥ new batch size ({value}) - sending immediately!")
-            self._process_batch()
-
-    def _on_batch_timeout_changed(self, value):
-        """Handle batch timeout change - IMMEDIATE EFFECT"""
-        old_timeout = self.batch_timeout
-        self.batch_timeout = float(value)
-        
-        self.log_with_timestamp(f"⏰ Batch timeout changed: {old_timeout}s → {value}s")
-        
-        # Restart timer with new timeout if we have queued files
-        if self.batch_timer and self.batch_timer.isActive() and self.batch_queue:
-            self.log_with_timestamp(f"⏱️ Restarting timer with new timeout: {value}s")
-            self._set_batch_timer()
 
     def update_embedding_status(self):
         """Update status display"""
@@ -606,7 +699,7 @@ class ExplorerWindow(QMainWindow):
         
         status_parts = []
         if self.batch_processing:
-            status_parts.append("🚀 Processing")
+            status_parts.append("")
         elif batch_size > 0:
             status_parts.append(f"📦 Batch: {batch_size}")
         if queue_size > 0:
@@ -671,7 +764,7 @@ class ExplorerWindow(QMainWindow):
         self.file_list.addItem(item)
 
     def start_monitoring(self, folder):
-        """Start folder monitoring - OPTIMIZED"""
+        """Start folder monitoring"""
         if not os.path.isdir(folder):
             return
         
@@ -687,7 +780,7 @@ class ExplorerWindow(QMainWindow):
             
             if self.watcher_data:
                 observer, event_handler = self.watcher_data
-                self.log_with_timestamp(f"🔄 Started monitoring: {os.path.basename(folder)}")
+                self.log_with_timestamp(f"🔄 Started monitoring: {os.path.basename(folder)} (Upload)")
                 
                 # Log initial status if available
                 if hasattr(event_handler, 'get_stats'):
@@ -710,7 +803,7 @@ class ExplorerWindow(QMainWindow):
                 self.log_with_timestamp(f"❌ Error stopping monitoring: {e}")
 
     def on_new_file_detected(self, file_path):
-        """Handle new file detection - MODE"""
+        """Handle new file detection"""
         filename = os.path.basename(file_path)
         if self._is_supported_image_file(filename):
             self.log_with_timestamp(f"🆕 New image detected: {filename}")
@@ -746,7 +839,7 @@ class ExplorerWindow(QMainWindow):
                 if self.file_queue.add_file(file_path):
                     retry_count += 1
         
-        self.log_with_timestamp(f"🔄 Retrying {retry_count} failed files")
+        self.log_with_timestamp(f"🔄 Retrying {retry_count} failed files with separated upload")
 
     def open_file(self, item):
         """Open file"""
@@ -809,7 +902,7 @@ class ExplorerWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle close event"""
-        self.log_with_timestamp("🔄 Shutting down...")
+        self.log_with_timestamp("🔄 Shutting down separated upload system...")
         self.stop_monitoring()
         self.file_queue.stop()
         if self.batch_timer and self.batch_timer.isActive():
@@ -817,5 +910,175 @@ class ExplorerWindow(QMainWindow):
         if hasattr(self, 'perf_timer'):
             self.perf_timer.stop()
         self.threadpool.waitForDone(3000)
-        self.log_with_timestamp("✅ Closed")
+        self.log_with_timestamp("✅ upload system closed")
         event.accept()
+
+
+# ===== COMPATIBILITY ADAPTER =====
+
+class SeparatedUploadAdapter:
+    """
+    Adapter to integrate separated upload system with existing codebase
+    This allows gradual migration without breaking existing functionality
+    """
+    
+    def __init__(self, api_base_url: str = API_BASE):
+        self.api_base_url = api_base_url
+        self.upload_manager = None
+        
+        # Initialize separated upload manager if available
+        if SeparatedUploadManager:
+            try:
+                self.upload_manager = SeparatedUploadManager(api_base_url)
+                logger.info("✅ upload adapter initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize separated upload manager: {e}")
+                self.upload_manager = None
+        else:
+            logger.warning("⚠️ SeparatedUploadManager not available, using fallback")
+    
+    def process_batch_faces_and_upload_separated(self, 
+                                               files_list: List[str], 
+                                               allowed_paths: List[str],
+                                               progress_callback=None) -> tuple:
+        """
+        Drop-in replacement for existing batch processing functions
+        
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        
+        if not self.upload_manager:
+            # Fallback to old system if separated upload not available
+            logger.warning("⚠️ upload not available, using fallback")
+            try:
+                from utils.face_detector import process_batch_faces_and_upload_optimized
+                return process_batch_faces_and_upload_optimized(files_list, allowed_paths)
+            except ImportError:
+                return False, "Neither separated upload nor fallback system available"
+        
+        try:
+            logger.info(f"🚀 Processing {len(files_list)} files with separated upload")
+            
+            # Process files and extract face data
+            photos_data = []
+            processing_errors = 0
+            
+            for file_path in files_list:
+                try:
+                    # Process faces in image
+                    faces = process_faces_in_image_optimized(file_path)
+                    
+                    if not faces:
+                        processing_errors += 1
+                        continue
+                    
+                    # Parse path codes (implement based on your system)
+                    relative_path = self._get_relative_path(file_path, allowed_paths)
+                    if not relative_path:
+                        processing_errors += 1
+                        continue
+                    
+                    unit_code, outlet_code, photo_type_code = self._parse_codes_from_path(relative_path)
+                    if not all([unit_code, outlet_code, photo_type_code]):
+                        processing_errors += 1
+                        continue
+                    
+                    # Convert codes to IDs (you'll need to implement this)
+                    unit_id, outlet_id, photo_type_id = self._resolve_codes_to_ids(
+                        unit_code, outlet_code, photo_type_code
+                    )
+                    
+                    photo_data = {
+                        'file_path': file_path,
+                        'unit_id': unit_id,
+                        'outlet_id': outlet_id,
+                        'photo_type_id': photo_type_id,
+                        'faces_data': faces
+                    }
+                    photos_data.append(photo_data)
+                    
+                except Exception as e:
+                    processing_errors += 1
+                    logger.error(f"❌ Processing error for {file_path}: {e}")
+            
+            if not photos_data:
+                return False, f"No valid photos to upload. {processing_errors} processing errors."
+            
+            # Use separated upload
+            results = self.upload_manager.upload_photos_sync(photos_data, progress_callback)
+            
+            # Process results
+            successful = len([r for r in results if r.success])
+            failed = len([r for r in results if not r.success])
+            
+            success_rate = (successful / len(results)) * 100 if results else 0
+            
+            if successful > 0:
+                message = f"upload: {successful}/{len(results)} successful ({success_rate:.1f}%)"
+                return True, message
+            else:
+                message = f"upload failed: 0/{len(results)} successful"
+                return False, message
+                
+        except Exception as e:
+            logger.error(f"❌ upload adapter error: {e}")
+            return False, f"upload failed: {str(e)}"
+    
+    def _get_relative_path(self, file_path: str, allowed_paths: List[str]) -> str:
+        """Get relative path from allowed paths"""
+        from pathlib import Path
+        
+        file_path_obj = Path(file_path).resolve()
+        
+        for root in allowed_paths:
+            root_path = Path(root).resolve()
+            try:
+                relative = file_path_obj.relative_to(root_path)
+                return str(relative)
+            except ValueError:
+                continue
+        
+        return None
+    
+    def _parse_codes_from_path(self, relative_path: str):
+        """Parse codes from relative path"""
+        from pathlib import Path
+        
+        try:
+            parts = Path(relative_path).parts
+            if len(parts) < 4:
+                return None, None, None
+
+            unit_code = parts[0].split("_")[0]
+            outlet_code = parts[1].split("_")[0]
+            photo_type_code = parts[2].split("_")[0]
+
+            return unit_code, outlet_code, photo_type_code
+        except:
+            return None, None, None
+    
+    def _resolve_codes_to_ids(self, unit_code: str, outlet_code: str, photo_type_code: str):
+        """
+        Convert codes to UUIDs - implement this based on your system
+        """
+        # TODO: Implement proper code-to-ID resolution
+        # This could be done via API call or local cache
+        return unit_code, outlet_code, photo_type_code
+
+
+# ===== GLOBAL ADAPTER INSTANCE =====
+
+# Create global adapter instance for easy integration
+separated_upload_adapter = SeparatedUploadAdapter()
+
+def process_batch_faces_and_upload_separated(files_list: List[str], 
+                                           allowed_paths: List[str],
+                                           progress_callback=None) -> tuple:
+    """
+    Global function that can be used as drop-in replacement
+    for existing batch upload functions
+    """
+    return separated_upload_adapter.process_batch_faces_and_upload_separated(
+        files_list, allowed_paths, progress_callback
+    )
