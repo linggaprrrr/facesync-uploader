@@ -31,7 +31,7 @@ class UploadConfig:
     """Configuration for optimized uploads"""
     api_base_url: str = API_BASE
     max_concurrent_data: int = 5  # Concurrent data uploads
-    max_concurrent_files: int = 3  # Concurrent file uploads
+    max_concurrent_files: int = 5  # Concurrent file uploads
     batch_size_data: int = 20  # Photos per data batch
     batch_size_files: int = 10  # Files per file batch
     retry_attempts: int = 3
@@ -1041,7 +1041,7 @@ class OptimizedFaceUploader:
                             photo_id = photo_status["photo_id"]
                             status = photo_status["status"]
                             
-                            if status == "completed" or status == 'pending_upload' :
+                            if status == "completed":
                                 # Photo is done
                                 upload_result = UploadResult(
                                     success=True,
