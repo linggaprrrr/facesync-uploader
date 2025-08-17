@@ -20,16 +20,16 @@ logger = logging.getLogger(__name__)
 class UploadConfig:
     """Configuration for separated uploads"""
     api_base_url: str = API_BASE
-    max_concurrent_data: int = 5
-    max_concurrent_files: int = 6
+    max_concurrent_data: int = 3
+    max_concurrent_files: int = 2
     batch_size_data: int = 15
-    batch_size_files: int = 20
+    batch_size_files: int = 10
     retry_attempts: int = 3
     retry_delay: float = 1.0
-    timeout_data: int = 60
-    timeout_files: int = 220
+    timeout_data: int = 30
+    timeout_files: int = 120
     status_check_interval: float = 2.0
-    max_status_checks: int = 60
+    max_status_checks: int = 30
 
 @dataclass
 class UploadResult:

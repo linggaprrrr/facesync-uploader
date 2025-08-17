@@ -234,7 +234,7 @@ class ExplorerWindow(QMainWindow):
                 'batch_size': 5,   # Smaller batches for faster data processing
                 'timeout': 0.5,
                 'validation': 'instant',
-                'concurrent': 20,   # More concurrent uploads
+                'concurrent': 10,   # More concurrent uploads
                 'description': 'Instant processing with separated uploads'
             },
             'speed': {
