@@ -648,7 +648,7 @@ class ExplorerWindow(QMainWindow):
         """Handle separated upload errors"""
         filename = os.path.basename(file_path) if file_path != "batch" else "batch"
         self.failed_count += 1
-        self.log_with_timestamp(f"❌ Upload error ({filename}): {error_message}")
+        # self.log_with_timestamp(f"❌ Upload error ({filename}): {error_message}")
 
     def _on_separated_upload_completed(self, successful_count, failed_count):
         """Handle separated upload completion statistics"""
