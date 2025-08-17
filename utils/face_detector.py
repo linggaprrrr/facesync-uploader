@@ -1041,7 +1041,7 @@ class OptimizedFaceUploader:
                             photo_id = photo_status["photo_id"]
                             status = photo_status["status"]
                             
-                            if status == "completed" or status == "pending_upload":
+                            if status == "completed" :
                                 # Photo is done
                                 upload_result = UploadResult(
                                     success=True,
