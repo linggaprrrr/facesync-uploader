@@ -1282,6 +1282,7 @@ class OptimizedBatchFaceEmbeddingWorker(QRunnable):
                         continue
                     
                     unit_code, outlet_code, photo_type_code = self._parse_codes_from_path(relative_path)
+                    print(f"Parsed codes: unit={unit_code}, outlet={outlet_code}, type={photo_type_code}")
                     if not all([unit_code, outlet_code, photo_type_code]):
                         processing_errors += 1
                         self.signals.error.emit(file_path, "Path parsing failed")
@@ -1359,8 +1360,8 @@ class OptimizedBatchFaceEmbeddingWorker(QRunnable):
                 return None, None, None
 
             unit_code = parts[0].split("_")[0]
-            outlet_code = parts[1].split("_")[0]
-            photo_type_code = parts[2].split("_")[0]
+            outlet_code = parts[2].split("_")[0]
+            photo_type_code = parts[1].split("_")[0]
 
             return unit_code, outlet_code, photo_type_code
         except Exception as e:

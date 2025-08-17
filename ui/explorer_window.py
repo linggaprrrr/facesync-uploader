@@ -192,8 +192,8 @@ class SeparatedUploadWorker(QRunnable):
                 return None, None, None
 
             unit_code = parts[0].split("_")[0]
-            outlet_code = parts[1].split("_")[0]
-            photo_type_code = parts[2].split("_")[0]
+            outlet_code = parts[2].split("_")[0]
+            photo_type_code = parts[1].split("_")[0]
 
             return unit_code, outlet_code, photo_type_code
         except:
