@@ -426,7 +426,7 @@ class SeparatedUploadManager:
                             photo_id = photo_status["photo_id"]
                             status = photo_status["status"]
                             
-                            if status == "completed":
+                            if status == "completed" or status == "pending_upload":
                                 # Photo completed successfully
                                 upload_result = UploadResult(
                                     success=True,

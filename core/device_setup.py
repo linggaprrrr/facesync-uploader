@@ -6,7 +6,7 @@ from facenet_pytorch import InceptionResnetV1
 
 # Ambil dari environment
 load_dotenv()
-API_BASE = os.getenv("BASE_URL")
+API_BASE = os.getenv('API_BASE', 'https://api.ownize.app')
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

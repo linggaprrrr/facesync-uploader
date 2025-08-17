@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import sys
 import logging
 import time
 from pathlib import Path
@@ -71,12 +72,61 @@ class UploadResult:
 import math
 from PIL import Image, ExifTags
 
+def get_model_path(model_filename="face_detection_yunet_2023mar.onnx"):
+    """Get correct model path for both development and PyInstaller"""
+    
+    # If running in PyInstaller bundle
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller bundle path
+        bundle_model_path = os.path.join(sys._MEIPASS, 'models', model_filename)
+        print(f"🔍 Checking PyInstaller bundle path: {bundle_model_path}")
+        
+        if os.path.exists(bundle_model_path):
+            print(f"✅ Found model in bundle: {bundle_model_path}")
+            return bundle_model_path
+        else:
+            print(f"❌ Model not found in bundle: {bundle_model_path}")
+            # List what's actually in the bundle models folder
+            bundle_models_dir = os.path.join(sys._MEIPASS, 'models')
+            if os.path.exists(bundle_models_dir):
+                files = os.listdir(bundle_models_dir)
+                print(f"📁 Bundle models folder contains: {files}")
+            else:
+                print(f"❌ Bundle models folder doesn't exist: {bundle_models_dir}")
+                # List bundle root contents
+                bundle_contents = os.listdir(sys._MEIPASS)
+                print(f"📁 Bundle root contains: {bundle_contents[:10]}...")
+    
+    # Development mode paths
+    dev_paths = [
+        f"models/{model_filename}",
+        model_filename,
+        f"./{model_filename}",
+        os.path.join(os.getcwd(), "models", model_filename)
+    ]
+    
+    print("🔍 Checking development paths:")
+    for path in dev_paths:
+        print(f"  Checking: {path}")
+        if os.path.exists(path):
+            print(f"✅ Found model in development: {path}")
+            return path
+        else:
+            print(f"❌ Not found: {path}")
+    
+    print(f"❌ Model {model_filename} not found in any location!")
+    return None
+
 class SmartFaceDetector:
     """Smart face detector untuk registration dengan auto-rotate dan face filtering"""
     
-    def __init__(self, model_path="models/face_detection_yunet_2023mar.onnx"):
+    def __init__(self, model_path=None):
         try:
-            if os.path.exists(model_path):
+            # Use the new path detection function
+            if model_path is None:
+                model_path = get_model_path("face_detection_yunet_2023mar.onnx")
+            
+            if model_path and os.path.exists(model_path):
                 self.detector = cv2.FaceDetectorYN.create(
                     model=model_path,
                     config="",
@@ -85,23 +135,10 @@ class SmartFaceDetector:
                     nms_threshold=0.3,
                     top_k=100
                 )
-                logger.info("✅ SmartFaceDetector initialized")
+                logger.info(f"✅ SmartFaceDetector initialized with: {model_path}")
             else:
-                # Fallback to default path
-                default_path = "face_detection_yunet_2023mar.onnx"
-                if os.path.exists(default_path):
-                    self.detector = cv2.FaceDetectorYN.create(
-                        model=default_path,
-                        config="",
-                        input_size=(640, 640),
-                        score_threshold=0.6,
-                        nms_threshold=0.3,
-                        top_k=100
-                    )
-                    logger.info("✅ SmartFaceDetector initialized with default path")
-                else:
-                    logger.error(f"❌ Model not found at {model_path} or {default_path}")
-                    self.detector = None
+                logger.error(f"❌ Model not found, tried: {model_path}")
+                self.detector = None
         except Exception as e:
             logger.error(f"❌ Failed to initialize SmartFaceDetector: {e}")
             self.detector = None
@@ -1004,7 +1041,7 @@ class OptimizedFaceUploader:
                             photo_id = photo_status["photo_id"]
                             status = photo_status["status"]
                             
-                            if status == "completed":
+                            if status == "completed" or status == "pending_upload":
                                 # Photo is done
                                 upload_result = UploadResult(
                                     success=True,
