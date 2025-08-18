@@ -22,9 +22,33 @@ import numpy as np
 from utils.file_queue import TurboFileQueue
 from core.device_setup import API_BASE
 
-# Import separated upload system
+
 try:
-    from utils.face_detector import process_faces_in_image_optimized
+    # Try to use speed-optimized version
+    from utils.face_detector import (
+        SmartFaceDetector,
+        EnhancedFaceDetector, 
+        process_faces_in_image_optimized,
+        get_smart_face_detector,
+        get_enhanced_face_detector,
+        configure_for_max_speed
+    )
+    print("✅ Using SPEED-OPTIMIZED face detector")
+    configure_for_max_speed()
+except ImportError as e:
+    print(f"⚠️ Speed detector not available: {e}")
+    # Fallback to original
+    from utils.face_detector import (
+        SmartFaceDetector,
+        EnhancedFaceDetector,
+        process_faces_in_image_optimized,
+        get_smart_face_detector,
+        get_enhanced_face_detector
+    )
+    print("ℹ️ Using original face detector")
+
+
+try:    
     from utils.separated_uploader import SeparatedUploadManager, UploadResult
     print("✅ Imported upload system")
 except ImportError:
@@ -622,7 +646,7 @@ class ExplorerWindow(QMainWindow):
         else:
             self.upload_status_label.setText("Status: Failed")
             self.upload_status_label.setStyleSheet("color: #F44336; font-weight: bold;")
-            self.log_with_timestamp(f"❌ upload failed: {message}")
+            self.log_with_timestamp(f"❌ upload failed (no faces) : {message}")
         
         # Reset status after delay
         QTimer.singleShot(3000, lambda: (
@@ -805,10 +829,13 @@ class ExplorerWindow(QMainWindow):
     def on_new_file_detected(self, file_path):
         """Handle new file detection"""
         filename = os.path.basename(file_path)
-        if self._is_supported_image_file(filename):
-            self.log_with_timestamp(f"🆕 New image detected: {filename}")
-            if self.file_queue.add_file(file_path):
-                self.log_with_timestamp(f"📝 Added to queue: {filename}")
+        
+        if self._is_supported_image_file(filename):            
+            if "_fr" in filename or "_FR" in filename:                
+                if self.file_queue.add_file(file_path):
+                    self.log_with_timestamp(f"📝 Added to queue: {filename}")
+            else:
+                self.log_with_timestamp(f"⏭️ Skipping image: {filename}")
 
     def on_file_deleted(self, file_path):
         """Handle file deletion"""
