@@ -797,27 +797,3 @@ def process_batch_faces_and_upload_separated(files_list: List[str],
 
 
 # Helper
-
-def _create_immediate_success_results(self, photo_ids: List[str], photos_data: List[Dict[str, Any]]) -> List[UploadResult]:
-    """Create immediate success results without status checking"""
-    results = []
-    
-    # Create file path mapping
-    file_path_map = {
-        photo_ids[i]: photos_data[i]['file_path'] 
-        for i in range(min(len(photo_ids), len(photos_data)))
-    }
-    
-    for photo_id in photo_ids:
-        result = UploadResult(
-            success=True,
-            photo_id=UUID(photo_id),
-            original_url=f"processing/{photo_id}",  # Placeholder URL
-            thumbnail_url=f"processing/{photo_id}/thumb",  # Placeholder URL
-            file_path=file_path_map.get(photo_id),
-            processing_time=0.0
-        )
-        results.append(result)
-    
-    logger.info(f"✅ Created {len(results)} immediate success results")
-    return results
