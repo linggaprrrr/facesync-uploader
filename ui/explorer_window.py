@@ -829,13 +829,10 @@ class ExplorerWindow(QMainWindow):
     def on_new_file_detected(self, file_path):
         """Handle new file detection"""
         filename = os.path.basename(file_path)
-        
-        if self._is_supported_image_file(filename):            
-            if "_fr" in filename or "_FR" in filename:                
-                if self.file_queue.add_file(file_path):
-                    self.log_with_timestamp(f"📝 Added to queue: {filename}")
-            else:
-                self.log_with_timestamp(f"⏭️ Skipping image: {filename}")
+        if self._is_supported_image_file(filename):
+            self.log_with_timestamp(f"🆕 New image detected: {filename}")
+            if self.file_queue.add_file(file_path):
+                self.log_with_timestamp(f"📝 Added to queue: {filename}")
 
     def on_file_deleted(self, file_path):
         """Handle file deletion"""
