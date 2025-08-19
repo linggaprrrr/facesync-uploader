@@ -42,7 +42,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='FaceUploaderApp 2.0.0',
+    name='FaceUploaderApp 2.0.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -58,5 +58,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    name='FaceUploaderApp v2.0.0'
+    name='FaceUploaderApp v2.0.1'
 )
