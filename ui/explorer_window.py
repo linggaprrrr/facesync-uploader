@@ -25,28 +25,14 @@ from core.device_setup import API_BASE
 
 try:
     # Try to use speed-optimized version
-    from utils.face_detector import (
-        SmartFaceDetector,
-        EnhancedFaceDetector, 
+    from utils.face_detector import (        
         process_faces_in_image_optimized,
-        get_smart_face_detector,
-        get_enhanced_face_detector,
-        configure_for_max_speed
     )
     print("✅ Using SPEED-OPTIMIZED face detector")
-    configure_for_max_speed()
+    
 except ImportError as e:
     print(f"⚠️ Speed detector not available: {e}")
-    # Fallback to original
-    from utils.face_detector import (
-        SmartFaceDetector,
-        EnhancedFaceDetector,
-        process_faces_in_image_optimized,
-        get_smart_face_detector,
-        get_enhanced_face_detector
-    )
-    print("ℹ️ Using original face detector")
-
+   
 
 try:    
     from utils.separated_uploader import SeparatedUploadManager, UploadResult
