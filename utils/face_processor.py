@@ -91,7 +91,7 @@ class StreamingFaceProcessor:
         """Initialize optimized face detector"""
         from utils.face_detector import HighPerformanceYuNetDetector
         self.detector = HighPerformanceYuNetDetector()
-        logger.info("✅ Face detector initialized")
+        logger.info("✅ Face detector initializeds")
         
     def _init_embedding_model(self):
         """Initialize embedding model with GPU support"""

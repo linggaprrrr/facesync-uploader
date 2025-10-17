@@ -15,6 +15,7 @@ import multiprocessing as mp
 import os
 import sys
 from dotenv import load_dotenv
+from core.device_setup import mtcnn
 
 load_dotenv()
 
@@ -27,21 +28,22 @@ def init_face_detector():
     """Initialize face detector exactly like your working app"""
     global face_detector
     if face_detector is None:
-        model_path = get_model_path("face_detection_yunet_2023mar.onnx")
-        if model_path:
-            face_detector = cv2.FaceDetectorYN.create(
-                model=model_path,
-                config="",
-                input_size=(640, 640),
-                score_threshold=0.6,    # Same as your working app
-                nms_threshold=0.3,      # Same as your working app
-                top_k=120             # Same as your working app
-            )
-            
+        # model_path = get_model_path("face_detection_yunet_2023mar.onnx")
+        # if model_path:
+        #     face_detector = cv2.FaceDetectorYN.create(
+        #         model=model_path,
+        #         config="",
+        #         input_size=(640, 640),
+        #         score_threshold=0.6,    # Same as your working app
+        #         nms_threshold=0.3,      # Same as your working app
+        #         top_k=120             # Same as your working app
+        #     )
+        face_detector = mtcnn  # Using MTCNN from facenet_pytorch as an alternative
+        
         if face_detector is None:
-            logger.error("❌ Gagal inisialisasi FaceDetectorYN.")
+            logger.error("❌ Gagal inisialisasi Face Detector.")
         else:
-            logger.info("✅ FaceDetectorYN berhasil diinisialisasi.")
+            logger.info("✅ Face Detector berhasil diinisialisasi.")
 
 def letterbox_resize(img, target_size=(640, 640)):
     """Letterbox resize function (adapted from your working app)"""
@@ -102,80 +104,61 @@ class SmartFaceDetector:
         logger.info("✅ SmartFaceDetector (working app pattern) initialized")
     
     def detect_and_filter_faces(self, img, is_reference=False, filter_statues=True):
-        """Detection using your working app's exact pattern"""
+        """Detection adapted for MTCNN"""
         try:
             global face_detector
-            
             if face_detector is None:
                 logger.error("❌ Face detector not initialized")
                 return []
-            
-            # Get original shape
+
             original_shape = img.shape[:2]
-            
-            # Letterbox resize (exactly like your working app)
-            resized_img, scale, pad = letterbox_resize(img, (640, 640))
-            
-            # Set input size and detect (exactly like your working app)
-            face_detector.setInputSize((resized_img.shape[1], resized_img.shape[0]))
-            retval, faces = face_detector.detect(resized_img)
-            
-            logger.info(f"🔍 Raw detection: {0 if faces is None else len(faces)} faces")
-            
-            if faces is None or len(faces) == 0:
+            logger.info(f"📐 Input image shape: {original_shape}")
+
+            # MTCNN expects RGB (OpenCV loads as BGR)
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            logger.info("🔍 Mulai deteksi wajah dengan MTCNN...")
+            boxes, probs = face_detector.detect(rgb_img)
+
+            if boxes is None or len(boxes) == 0:
+                logger.warning("⚠️ Tidak ada wajah terdeteksi.")
                 return []
-            
-            # Process faces (adapted from your working app)
+
+            logger.info(f"✅ {len(boxes)} wajah terdeteksi oleh MTCNN.")
+
             processed_faces = []
-            
-            for i, face in enumerate(faces):
+            for i, (box, prob) in enumerate(zip(boxes, probs)):
                 try:
-                    x, y, w, h = map(int, face[:4])
-                    confidence = face[4] if len(face) > 4 else face[14] if len(face) > 14 else 0.8
-                    
-                    # Basic validation
+                    x1, y1, x2, y2 = map(int, box)
+                    w, h = x2 - x1, y2 - y1
+
                     if w <= 0 or h <= 0:
                         continue
-                    
-                    # Create bbox dict
-                    bbox_dict = {"x": x, "y": y, "w": w, "h": h}
-                    
-                    # Reverse letterbox to get original coordinates
-                    original_bbox = reverse_letterbox(
-                        bbox=bbox_dict,
-                        original_shape=original_shape,
-                        resized_shape=resized_img.shape[:2],
-                        pad=pad,
-                        scale=scale
-                    )
-                    
-                    # Convert back to face format for compatibility
+
                     processed_face = [
-                        float(original_bbox["x"]),
-                        float(original_bbox["y"]),
-                        float(original_bbox["w"]),
-                        float(original_bbox["h"]),
-                        float(confidence)
+                        float(x1),
+                        float(y1),
+                        float(w),
+                        float(h),
+                        float(prob)
                     ]
-                    
-                    # Add remaining values if they exist
-                    if len(face) > 5:
-                        processed_face.extend(face[5:])
-                    
                     processed_faces.append(processed_face)
-                    
+
+                    logger.info(f"🧩 Wajah {i}: box=({x1},{y1},{w},{h}), prob={prob:.2f}")
+
                 except Exception as e:
                     logger.error(f"❌ Error processing face {i}: {e}")
                     continue
-            
-            # Reference mode: select largest face (like your working app)
+
+            # Pilih wajah terbesar untuk referensi
             if is_reference and processed_faces:
                 processed_faces = sorted(processed_faces, key=lambda f: f[2] * f[3], reverse=True)
-                processed_faces = [processed_faces[0]]  # Only the largest
-            
+                processed_faces = [processed_faces[0]]
+                logger.info("📌 Mode referensi: memilih wajah terbesar.")
+
             logger.info(f"✅ Processed faces: {len(processed_faces)}")
             return processed_faces
-            
+
         except Exception as e:
             logger.error(f"❌ Detection error: {e}")
             return []
