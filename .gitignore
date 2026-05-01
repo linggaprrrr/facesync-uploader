@@ -6,22 +6,25 @@ __pycache__/
 *.pyo
 *.log
 
-# Virtual environments (jika pakai)
+# Virtual environments
 venv/
 env/
 .venv/
-
-fr-uploader
 
 # PyInstaller
 build/
 dist/
 *.spec
 
-# Konfigurasi lokal & environment
+# Local config & secrets
 .env
 *.env
 app_config.json
+
+# Large binary / generated folders
+fr-uploader/
+models/
+assets/
 
 # VSCode / IDE
 .vscode/
