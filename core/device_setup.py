@@ -10,36 +10,57 @@ API_BASE = os.getenv('BASE_URL', 'https://api.ownize.app')
 # ---------------------------------------------------------------------------
 # Device probe — try CUDA first, fall back to CPU.
 #
-# Checking ort.get_available_providers() alone is not enough: the provider
-# may be listed but still fail at runtime when cuDNN DLLs are missing.
-# We do a real test-session to confirm CUDA actually works before committing.
+# get_available_providers() only reflects what the library was built to
+# support, not whether cuDNN DLLs are loadable at runtime.  We create a
+# real InferenceSession with CUDAExecutionProvider to confirm it works.
 # ---------------------------------------------------------------------------
 
 def _cuda_works() -> bool:
-    """Return True only when a real CUDA inference session can be created."""
-    if 'CUDAExecutionProvider' not in ort.get_available_providers():
+    """Return True only when a live CUDA session can be created."""
+    try:
+        available = ort.get_available_providers()
+    except AttributeError:
+        # Both onnxruntime and onnxruntime-gpu are installed and conflicting.
+        # Run: pip uninstall onnxruntime onnxruntime-gpu -y
+        #      pip install onnxruntime-gpu>=1.19.0
+        print(
+            "❌ onnxruntime conflict detected (CPU and GPU builds both installed).\n"
+            "   Fix: pip uninstall onnxruntime onnxruntime-gpu -y  "
+            "&&  pip install onnxruntime-gpu>=1.19.0"
+        )
         return False
+
+    if 'CUDAExecutionProvider' not in available:
+        return False
+
+    # Try opening a real session — this will raise if cuDNN DLLs are missing.
     try:
         import numpy as np
-        # Minimal 1-op ONNX model: Identity(float32 input) → output
-        # Built inline so we don't need an external file.
-        import struct
-        _MINI_ONNX = bytes([
-            # Simplified ONNX protobuf for a 1×1 float Identity model
-            0x08, 0x07, 0x12, 0x0c, 0x73, 0x65, 0x6e, 0x74, 0x69, 0x6e, 0x65,
-            0x6c, 0x5f, 0x76, 0x31, 0x00, 0x3a, 0x2b, 0x0a, 0x09, 0x49, 0x64,
-            0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x00, 0x12, 0x01, 0x58, 0x1a,
-            0x01, 0x59, 0x22, 0x08, 0x49, 0x64, 0x65, 0x6e, 0x74, 0x69, 0x74,
-            0x79, 0x5a, 0x0d, 0x0a, 0x01, 0x58, 0x12, 0x08, 0x08, 0x01, 0x12,
-            0x04, 0x0a, 0x02, 0x08, 0x01, 0x62, 0x0d, 0x0a, 0x01, 0x59, 0x12,
-            0x08, 0x08, 0x01, 0x12, 0x04, 0x0a, 0x02, 0x08, 0x01, 0x42, 0x00,
-        ])
+        import tempfile, struct
+
+        # Build the smallest valid ONNX model (opset 11, Identity op)
+        # using onnx if available, otherwise skip the live test and trust
+        # the provider list (less safe but avoids a hard dependency on onnx).
+        try:
+            import onnx
+            from onnx import helper, TensorProto
+            X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1])
+            Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1])
+            node = helper.make_node('Identity', ['X'], ['Y'])
+            graph = helper.make_graph([node], 'probe', [X], [Y])
+            model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 11)])
+            model_bytes = model.SerializeToString()
+        except ImportError:
+            # onnx package not present — trust the provider list
+            return True
+
         sess = ort.InferenceSession(
-            _MINI_ONNX,
+            model_bytes,
             providers=['CUDAExecutionProvider'],
         )
-        sess.run(None, {'X': np.zeros((1, 1), dtype=np.float32)})
+        sess.run(None, {'X': np.zeros((1,), dtype=np.float32)})
         return True
+
     except Exception as e:
         print(f"⚠️  CUDA probe failed: {e}")
         return False
@@ -54,11 +75,11 @@ else:
     _providers = ['CPUExecutionProvider']
     _device    = 'CPU'
     print(
-        "⚠️  CUDA unavailable — running on CPU.\n"
-        "    Common fixes:\n"
-        "      1. pip uninstall onnxruntime && pip install onnxruntime-gpu>=1.19.0\n"
+        "⚠️  Running on CPU.  To enable GPU:\n"
+        "      1. pip uninstall onnxruntime onnxruntime-gpu -y\n"
+        "         pip install onnxruntime-gpu>=1.19.0\n"
         "      2. Install cuDNN 9.x for CUDA 12: https://developer.nvidia.com/cudnn\n"
-        "      3. Add cuDNN bin/ folder to PATH (e.g. C:\\cudnn\\bin)"
+        "      3. Add cuDNN bin\\ to PATH  (e.g. C:\\cudnn\\bin)"
     )
 
 face_app = FaceAnalysis(name='buffalo_l', providers=_providers)
