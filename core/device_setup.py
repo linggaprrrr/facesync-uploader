@@ -1,19 +1,25 @@
 import os
-import torch
 from dotenv import load_dotenv
-from facenet_pytorch import InceptionResnetV1, MTCNN
+from insightface.app import FaceAnalysis
 
-
-# Ambil dari environment
 load_dotenv()
-API_BASE = os.getenv('API_BASE', 'https://api.ownize.app')
 
+API_BASE = os.getenv('BASE_URL', 'https://api.ownize.app')
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-mtcnn = MTCNN(image_size=160, margin=20, keep_all=True, device=device)
-# Check device
-if torch.cuda.is_available():
-    print(f"✅ Using CUDA - GPU: {torch.cuda.get_device_name()}")
-else:
-    print("⚠️ Using CPU")
+# InsightFace buffalo_l: SCRFD-10G (face detector) + ArcFace R100 (512-dim embeddings)
+# Tries CUDAExecutionProvider first, falls back to CPU automatically.
+face_app = FaceAnalysis(
+    name='buffalo_l',
+    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+)
+face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+try:
+    import onnxruntime as ort
+    active_providers = ort.get_available_providers()
+    if 'CUDAExecutionProvider' in active_providers:
+        print("✅ InsightFace buffalo_l on GPU (CUDA) — SCRFD-10G + ArcFace R100")
+    else:
+        print("⚠️ InsightFace buffalo_l on CPU — SCRFD-10G + ArcFace R100")
+except Exception:
+    print("✅ InsightFace buffalo_l loaded — SCRFD-10G + ArcFace R100")

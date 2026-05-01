@@ -1,2 +1,2 @@
-from .device_setup import device, resnet, API_BASE, mtcnn
+from .device_setup import face_app, API_BASE
 from .watcher import start_watcher, stop_watcher

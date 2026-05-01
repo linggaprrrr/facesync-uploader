@@ -2,4 +2,3 @@ from .face_detector import process_faces_in_image_optimized
 from .separated_uploader import SeparatedUploadManager
 from .file_checker import HighPerformanceFileChecker
 from .file_queue import TurboFileQueue
-from .face_processor import StreamingFaceProcessor

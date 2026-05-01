@@ -34,13 +34,7 @@ except ImportError as e:
     print(f"⚠️ Speed detector not available: {e}")
    
 
-try:    
-    from utils.separated_uploader import SeparatedUploadManager, UploadResult
-    print("✅ Imported upload system")
-except ImportError:
-    print("❌ Warning: upload system not found, using fallback")
-    from utils.face_detector import OptimizedBatchFaceEmbeddingWorker
-    SeparatedUploadManager = None
+from utils.separated_uploader import SeparatedUploadManager, UploadResult
 
 # Import with try-except to avoid errors
 try:

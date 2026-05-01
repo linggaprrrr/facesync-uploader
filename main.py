@@ -64,12 +64,6 @@ class MainApplication:
                 logger.info("🔄 Closing main window...")
                 self.main_window.close()
             
-            # Cleanup face detection system
-            if self.face_detection_initialized:
-                logger.info("🔄 Cleaning up face detection system...")
-                cleanup_optimized_face_detection()
-                self.face_detection_initialized = False
-            
             logger.info("✅ Application cleanup completed successfully")
             
         except Exception as e:
