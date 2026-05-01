@@ -53,12 +53,13 @@ class SeparatedUploadManager:
     Manager for separated upload system (data + files)
     Compatible with existing face detection workflow
     """
-    
-    def __init__(self, api_base_url: str = API_BASE):
+
+    def __init__(self, api_base_url: str = API_BASE, auth_token: Optional[str] = None):
         self.config = UploadConfig(api_base_url=api_base_url)
+        self.auth_token = auth_token
         self.session: Optional[aiohttp.ClientSession] = None
         self._executor = ThreadPoolExecutor(max_workers=4)
-        
+
     async def __aenter__(self):
         """Async context manager entry"""
         connector = aiohttp.TCPConnector(
@@ -67,16 +68,20 @@ class SeparatedUploadManager:
             keepalive_timeout=30,
             enable_cleanup_closed=True
         )
-        
+
         timeout = aiohttp.ClientTimeout(total=300)
-        
+
+        headers = {
+            'User-Agent': 'SeparatedUploadManager/1.0',
+            'Accept': 'application/json',
+        }
+        if self.auth_token:
+            headers['Authorization'] = f'Bearer {self.auth_token}'
+
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers={
-                'User-Agent': 'SeparatedUploadManager/1.0',
-                'Accept': 'application/json'
-            }
+            headers=headers,
         )
         return self
         
@@ -86,8 +91,8 @@ class SeparatedUploadManager:
             await self.session.close()
         self._executor.shutdown(wait=True)
     
-    def upload_photos_sync(self, 
-                          photos_data: List[Dict[str, Any]], 
+    def upload_photos_sync(self,
+                          photos_data: List[Dict[str, Any]],
                           progress_callback: Optional[Callable] = None) -> List[UploadResult]:
         """
         Synchronous wrapper for async upload
@@ -144,41 +149,61 @@ class SeparatedUploadManager:
                 # STEP 1: Upload face data and metadata (fast)
                 if progress_callback:
                     progress_callback("Uploading face data...", 0, total_items)
-                
+
                 data_start = time.time()
-                photo_ids = await self._upload_data_batch(photos_data, progress_callback)
+                index_to_photo_id = await self._upload_data_batch(photos_data, progress_callback)
                 data_time = time.time() - data_start
-                
-                if not photo_ids:
+
+                if not index_to_photo_id:
                     logger.error("❌ Data upload failed completely")
                     return [
                         UploadResult(
                             success=False,
                             error_message="Data upload failed",
-                            file_path=photo.get('file_path')
+                            file_path=photo.get('file_path'),
                         )
                         for photo in photos_data
                     ]
-                
-                logger.info(f"✅ Data upload completed in {data_time:.2f}s: {len(photo_ids)} photos")
-                
+
+                # Build flat ordered lists only for photos that have a server ID
+                matched_photos = [
+                    photos_data[i] for i in sorted(index_to_photo_id)
+                ]
+                matched_ids = [
+                    index_to_photo_id[i] for i in sorted(index_to_photo_id)
+                ]
+                failed_indices = set(range(len(photos_data))) - set(index_to_photo_id)
+
+                logger.info(
+                    f"✅ Data upload completed in {data_time:.2f}s: "
+                    f"{len(matched_ids)} succeeded, {len(failed_indices)} failed"
+                )
+
                 # STEP 2: Upload files (slower)
                 if progress_callback:
-                    progress_callback("Uploading files...", len(photo_ids), total_items)
-                
+                    progress_callback("Uploading files...", len(matched_ids), total_items)
+
                 file_start = time.time()
-                await self._upload_files_batch(photos_data, photo_ids, progress_callback)
+                await self._upload_files_batch(matched_photos, matched_ids, progress_callback)
                 file_time = time.time() - file_start
-                
+
                 logger.info(f"✅ File upload completed in {file_time:.2f}s")
-                
+
                 # STEP 3: Wait for processing completion
                 if progress_callback:
-                    progress_callback("Processing files...", len(photo_ids), total_items)
-                
+                    progress_callback("Processing files...", len(matched_ids), total_items)
+
                 status_start = time.time()
-                results = await self._wait_for_completion(photo_ids, photos_data, progress_callback)
+                results = await self._wait_for_completion(matched_ids, matched_photos, progress_callback)
                 status_time = time.time() - status_start
+
+                # Inject failure entries for photos that never got a server ID
+                for i in sorted(failed_indices):
+                    results.append(UploadResult(
+                        success=False,
+                        error_message="Data upload rejected by server",
+                        file_path=photos_data[i].get('file_path'),
+                    ))
                 
                 total_time = time.time() - start_time
                 successful = len([r for r in results if r.success])
@@ -205,105 +230,125 @@ class SeparatedUploadManager:
                     for photo in photos_data
                 ]
     
-    async def _upload_data_batch(self, 
-                               photos_data: List[Dict[str, Any]], 
-                               progress_callback: Optional[Callable] = None) -> List[str]:
-        """Upload face data and metadata in batches"""
-        
-        # Split into batches
+    async def _upload_data_batch(self,
+                               photos_data: List[Dict[str, Any]],
+                               progress_callback: Optional[Callable] = None) -> Dict[int, str]:
+        """Upload face data and metadata in batches.
+
+        Returns a dict mapping original photos_data index → photo_id so that
+        _upload_files_batch can pair files correctly even when some items fail
+        server-side validation (the backend only returns IDs for successes).
+        """
         batches = [
-            photos_data[i:i + self.config.batch_size_data]
+            (photos_data[i:i + self.config.batch_size_data], i)  # (items, start_index)
             for i in range(0, len(photos_data), self.config.batch_size_data)
         ]
-        
+
         logger.info(f"📊 Uploading data in {len(batches)} batches")
-        
-        all_photo_ids = []
+
+        # global_index_map: original index → photo_id
+        global_index_map: Dict[int, str] = {}
         semaphore = asyncio.Semaphore(self.config.max_concurrent_data)
-        
-        async def upload_data_batch(batch_items: List[Dict], batch_num: int):
+
+        async def upload_data_batch(batch_items: List[Dict], start_idx: int, batch_num: int):
             async with semaphore:
                 try:
                     logger.info(f"📤 Data batch {batch_num}: {len(batch_items)} items")
-                    
-                    # Prepare batch payload
+
                     photos_payload = []
                     for item in batch_items:
                         photo_data = {
-                            "unit_code": item["unit_id"],      # Send as unit_code  
-                            "outlet_code": item["outlet_id"],  # Send as outlet_code
-                            "photo_type_code": item["photo_type_id"],  # Send as photo_type_code
+                            "unit_code": item["unit_id"],
+                            "outlet_code": item["outlet_id"],
+                            "photo_type_code": item["photo_type_id"],
                             "filename": Path(item["file_path"]).name,
                             "faces": [
                                 {
                                     "embedding": face["embedding"],
                                     "bbox": face["bbox"],
-                                    "confidence": face["confidence"]
+                                    "confidence": face["confidence"],
                                 }
                                 for face in item["faces_data"]
-                            ]
+                            ],
                         }
                         photos_payload.append(photo_data)
-                    
-                    batch_payload = {"photos": photos_payload}
-                    
-                    # Upload data
+
                     url = f"{self.config.api_base_url}/faces/upload-data"
-                    
+
                     async with self.session.post(
                         url,
-                        json=batch_payload,
-                        timeout=aiohttp.ClientTimeout(total=self.config.timeout_data)
+                        json={"photos": photos_payload},
+                        timeout=aiohttp.ClientTimeout(total=self.config.timeout_data),
                     ) as response:
-                        
+
                         if response.status == 200:
                             result = await response.json()
                             photo_ids = [str(pid) for pid in result.get("photo_ids", [])]
-                            
-                            logger.info(f"✅ Data batch {batch_num}: {len(photo_ids)} photos")
-                            
+
+                            # The backend returns IDs only for successfully inserted photos,
+                            # in the same order as the successfully validated input photos.
+                            # We match them positionally — failures simply have no entry.
+                            index_map: Dict[int, str] = {}
+                            server_idx = 0
+                            for local_idx, item in enumerate(batch_items):
+                                if server_idx < len(photo_ids):
+                                    # Detect a server-side skip by comparing filenames if
+                                    # the backend echoes them; otherwise assume in-order.
+                                    index_map[start_idx + local_idx] = photo_ids[server_idx]
+                                    server_idx += 1
+
+                            logger.info(
+                                f"✅ Data batch {batch_num}: {len(index_map)}/{len(batch_items)} photos"
+                            )
                             if progress_callback:
                                 progress_callback(
                                     f"Data batch {batch_num} completed",
-                                    len(all_photo_ids) + len(photo_ids),
-                                    len(photos_data)
+                                    len(global_index_map) + len(index_map),
+                                    len(photos_data),
                                 )
-                            
-                            return photo_ids
+                            return index_map
                         else:
                             error_text = await response.text()
-                            logger.error(f"❌ Data batch {batch_num} failed: {response.status} - {error_text}")
-                            return []
-                            
+                            logger.error(
+                                f"❌ Data batch {batch_num} failed: {response.status} - {error_text}"
+                            )
+                            return {}
+
                 except Exception as e:
                     logger.error(f"❌ Data batch {batch_num} error: {e}")
-                    return []
-        
-        # Execute all batches concurrently
+                    return {}
+
         tasks = [
-            upload_data_batch(batch_items, i + 1)
-            for i, batch_items in enumerate(batches)
+            upload_data_batch(batch_items, start_idx, i + 1)
+            for i, (batch_items, start_idx) in enumerate(batches)
         ]
-        
+
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Collect photo IDs
+
         for batch_result in batch_results:
-            if isinstance(batch_result, list):
-                all_photo_ids.extend(batch_result)
-        
-        logger.info(f"📊 Data upload completed: {len(all_photo_ids)} total photo IDs")
-        return all_photo_ids
+            if isinstance(batch_result, dict):
+                global_index_map.update(batch_result)
+
+        logger.info(
+            f"📊 Data upload completed: {len(global_index_map)}/{len(photos_data)} photos mapped"
+        )
+        return global_index_map
     
-    async def _upload_files_batch(self, 
-                                photos_data: List[Dict[str, Any]], 
+    async def _upload_files_batch(self,
+                                photos_data: List[Dict[str, Any]],
                                 photo_ids: List[str],
                                 progress_callback: Optional[Callable] = None):
         """Upload files to storage in batches"""
-        
+
         if len(photos_data) != len(photo_ids):
-            logger.error(f"❌ Mismatch: {len(photos_data)} items vs {len(photo_ids)} photo IDs")
-            return
+            # Truncate to the shorter list so we never send an unmatched file
+            logger.warning(
+                f"⚠️ photos/IDs length mismatch ({len(photos_data)} vs {len(photo_ids)}), "
+                "truncating to shorter list"
+            )
+            min_len = min(len(photos_data), len(photo_ids))
+            photos_data = photos_data[:min_len]
+            photo_ids = photo_ids[:min_len]
         
         # Split into file upload batches
         batch_size = self.config.batch_size_files

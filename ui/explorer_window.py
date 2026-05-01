@@ -65,12 +65,14 @@ class SeparatedUploadWorkerSignals(QObject):
 
 class SeparatedUploadWorker(QRunnable):
     """Worker that uses the new separated upload system"""
-    
-    def __init__(self, files_list: List[str], allowed_paths: List[str], api_base_url: str = API_BASE):
+
+    def __init__(self, files_list: List[str], allowed_paths: List[str],
+                 api_base_url: str = API_BASE, auth_token: str = None):
         super().__init__()
         self.files_list = files_list
         self.allowed_paths = allowed_paths
         self.api_base_url = api_base_url
+        self.auth_token = auth_token
         self.signals = SeparatedUploadWorkerSignals()
         
     def run(self):
@@ -140,8 +142,8 @@ class SeparatedUploadWorker(QRunnable):
             # Use separated upload manager
             if SeparatedUploadManager:
                 self.signals.progress.emit("Starting upload...", "0/0")
-                
-                upload_manager = SeparatedUploadManager(self.api_base_url)
+
+                upload_manager = SeparatedUploadManager(self.api_base_url, auth_token=self.auth_token)
                 results = upload_manager.upload_photos_sync(photos_data, progress_callback)
                 
                 # Process results
@@ -592,7 +594,8 @@ class ExplorerWindow(QMainWindow):
         self.upload_status_label.setStyleSheet("color: #FF9800; font-weight: bold;")
         
         # Create and start worker
-        worker = SeparatedUploadWorker(files_list, self.allowed_paths, self.api_base_url)
+        auth_token = self.config_manager.config.get("auth_token")
+        worker = SeparatedUploadWorker(files_list, self.allowed_paths, self.api_base_url, auth_token=auth_token)
         worker.signals.progress.connect(self._on_separated_upload_progress)
         worker.signals.finished.connect(self._on_separated_upload_finished)
         worker.signals.error.connect(self._on_separated_upload_error)
@@ -1046,28 +1049,31 @@ class SeparatedUploadAdapter:
         return None
     
     def _parse_codes_from_path(self, relative_path: str):
-        """Parse codes from relative path"""
+        """Parse codes from relative path.
+
+        Expected folder structure:
+          {unit_code}_{...} / {photo_type_code}_{...} / {outlet_code}_{...} / file.jpg
+          parts[0]            parts[1]                   parts[2]
+        """
         from pathlib import Path
-        
+
         try:
             parts = Path(relative_path).parts
             if len(parts) < 4:
                 return None, None, None
 
-            unit_code = parts[0].split("_")[0]
-            outlet_code = parts[1].split("_")[0]
-            photo_type_code = parts[2].split("_")[0]
+            unit_code       = parts[0].split("_")[0]
+            photo_type_code = parts[1].split("_")[0]
+            outlet_code     = parts[2].split("_")[0]
 
             return unit_code, outlet_code, photo_type_code
-        except:
+        except Exception:
             return None, None, None
-    
+
     def _resolve_codes_to_ids(self, unit_code: str, outlet_code: str, photo_type_code: str):
         """
         Convert codes to UUIDs - implement this based on your system
         """
-        # TODO: Implement proper code-to-ID resolution
-        # This could be done via API call or local cache
         return unit_code, outlet_code, photo_type_code
 
 

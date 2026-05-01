@@ -62,8 +62,16 @@ def process_faces_in_image_optimized(
             if w <= 0 or h <= 0:
                 continue
 
+            # L2-normalize so Milvus cosine/IP similarity is reliable.
+            # ArcFace R100 outputs raw (non-unit) vectors at inference time;
+            # normalizing here keeps the embedding space consistent with
+            # server-side Celery processing which also normalizes before insert.
+            raw = face.embedding
+            norm = np.linalg.norm(raw)
+            embedding = (raw / norm).tolist() if norm > 0 else raw.tolist()
+
             results.append({
-                'embedding': face.embedding.tolist(),   # 512-dim ArcFace R100
+                'embedding': embedding,
                 'bbox': {'x': x1, 'y': y1, 'w': w, 'h': h},
                 'confidence': float(face.det_score),
             })
@@ -117,8 +125,13 @@ def process_faces_from_bytes(
             w, h = x2 - x1, y2 - y1
             if w <= 0 or h <= 0:
                 continue
+
+            raw = face.embedding
+            norm = np.linalg.norm(raw)
+            embedding = (raw / norm).tolist() if norm > 0 else raw.tolist()
+
             results.append({
-                'embedding': face.embedding.tolist(),
+                'embedding': embedding,
                 'bbox': {'x': x1, 'y': y1, 'w': w, 'h': h},
                 'confidence': float(face.det_score),
             })
