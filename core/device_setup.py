@@ -1,4 +1,5 @@
 import os
+import onnxruntime as ort
 from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 
@@ -6,20 +7,24 @@ load_dotenv()
 
 API_BASE = os.getenv('BASE_URL', 'https://api.ownize.app')
 
-# InsightFace buffalo_l: SCRFD-10G (face detector) + ArcFace R100 (512-dim embeddings)
-# Tries CUDAExecutionProvider first, falls back to CPU automatically.
-face_app = FaceAnalysis(
-    name='buffalo_l',
-    providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-)
-face_app.prepare(ctx_id=0, det_size=(640, 640))
+# ---------------------------------------------------------------------------
+# Device selection: GPU (CUDA device 0) when available, CPU otherwise.
+# ctx_id=0  → GPU device 0  (InsightFace uses this to pick the CUDA device)
+# ctx_id=-1 → CPU           (InsightFace forces CPU mode)
+# ---------------------------------------------------------------------------
+_available_providers = ort.get_available_providers()
+_cuda_available = 'CUDAExecutionProvider' in _available_providers
 
-try:
-    import onnxruntime as ort
-    active_providers = ort.get_available_providers()
-    if 'CUDAExecutionProvider' in active_providers:
-        print("✅ InsightFace buffalo_l on GPU (CUDA) — SCRFD-10G + ArcFace R100")
-    else:
-        print("⚠️ InsightFace buffalo_l on CPU — SCRFD-10G + ArcFace R100")
-except Exception:
-    print("✅ InsightFace buffalo_l loaded — SCRFD-10G + ArcFace R100")
+if _cuda_available:
+    _ctx_id   = 0
+    _providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    _device    = 'GPU (CUDA device 0)'
+else:
+    _ctx_id   = -1
+    _providers = ['CPUExecutionProvider']
+    _device    = 'CPU'
+
+face_app = FaceAnalysis(name='buffalo_l', providers=_providers)
+face_app.prepare(ctx_id=_ctx_id, det_size=(640, 640))
+
+print(f"✅ InsightFace buffalo_l on {_device} — SCRFD-10G + ArcFace R100")
