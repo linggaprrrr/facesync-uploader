@@ -2,6 +2,7 @@
 
 import os
 import sys
+import glob
 from PyInstaller.utils.hooks import (
     collect_submodules,
     collect_data_files,
@@ -43,9 +44,9 @@ for pkg in [
     'watchdog',
     'watchdog.observers',
     'watchdog.events',
-    'watchdog.observers.fsevents',   # macOS
-    'watchdog.observers.inotify',    # Linux
-    'watchdog.observers.winapi',     # Windows
+    'watchdog.observers.fsevents',
+    'watchdog.observers.inotify',
+    'watchdog.observers.winapi',
     'aiohttp',
     'aiohttp.web',
     'aiohttp.connector',
@@ -63,6 +64,8 @@ for pkg in [
     'botocore',
     'boto3',
     'asyncio',
+    'ctypes',
+    'site',
     'logging',
     'logging.handlers',
     'json',
@@ -84,7 +87,6 @@ for pkg in [
     except Exception:
         hiddenimports.append(pkg)
 
-# De-duplicate
 hiddenimports = sorted(set(hiddenimports))
 
 # ---------------------------------------------------------------------------
@@ -98,9 +100,8 @@ datas = [
     ('models',  'models'),
 ]
 
-# Collect data files shipped inside Python packages
 for pkg in [
-    'certifi',          # CA bundle (requests TLS)
+    'certifi',
     'aiohttp',
     'onnxruntime',
     'sqlalchemy',
@@ -113,14 +114,13 @@ for pkg in [
     except Exception:
         pass
 
-# PyQt5 Qt resource data (translations, etc.)
 try:
     datas += collect_data_files('PyQt5', include_py_files=False)
 except Exception:
     pass
 
 # ---------------------------------------------------------------------------
-# Binaries — native shared libraries that Python packages depend on
+# Binaries — native shared libraries
 # ---------------------------------------------------------------------------
 binaries = []
 
@@ -135,6 +135,33 @@ for pkg in [
     except Exception:
         pass
 
+# onnxruntime CUDA provider DLLs (onnxruntime_providers_cuda.dll,
+# onnxruntime_providers_shared.dll, onnxruntime_providers_tensorrt.dll)
+# These are NOT picked up by collect_dynamic_libs('onnxruntime') because
+# they live in capi\ and are loaded at runtime via LoadLibrary.
+try:
+    import onnxruntime as _ort
+    _ort_capi = os.path.join(os.path.dirname(_ort.__file__), 'capi')
+    for _dll in glob.glob(os.path.join(_ort_capi, 'onnxruntime_providers_*.dll')):
+        binaries.append((_dll, 'onnxruntime/capi'))
+except Exception:
+    pass
+
+# cuDNN + CUDA runtime DLLs installed via  pip install nvidia-cudnn-cu12
+# They land in  site-packages\nvidia\<pkg>\bin\*.dll
+try:
+    import site as _site
+    for _sp in _site.getsitepackages():
+        _nvidia_root = os.path.join(_sp, 'nvidia')
+        if os.path.isdir(_nvidia_root):
+            for _pkg_name in os.listdir(_nvidia_root):
+                _bin_dir = os.path.join(_nvidia_root, _pkg_name, 'bin')
+                if os.path.isdir(_bin_dir):
+                    for _dll in glob.glob(os.path.join(_bin_dir, '*.dll')):
+                        binaries.append((_dll, f'nvidia/{_pkg_name}/bin'))
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
@@ -148,7 +175,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Heavy ML frameworks not used by this app
         'tensorflow',
         'torch',
         'torchvision',
@@ -156,7 +182,7 @@ a = Analysis(
         'matplotlib',
         'scipy',
         'pandas',
-        'PIL.ImageTk',   # Tkinter backend — not needed
+        'PIL.ImageTk',
         'tkinter',
         'test',
         'unittest',
@@ -185,7 +211,7 @@ exe = EXE(
     strip=False,
     upx=True,
     upx_exclude=[
-        # Never compress these — they break when UPX touches them
+        # Never UPX-compress these — they break
         'vcruntime140.dll',
         'msvcp140.dll',
         'Qt5Core.dll',
@@ -194,10 +220,15 @@ exe = EXE(
         'qwindows.dll',
         'onnxruntime*.dll',
         '_pybind_state*.pyd',
+        'cudnn*.dll',
+        'cublas*.dll',
+        'cufft*.dll',
+        'cudart*.dll',
+        'nvinfer*.dll',
     ],
-    console=False,          # No terminal window on end-user machines
+    console=False,
     icon='assets/ownize_logo.ico',
-    version=_version_file,  # Windows only: embed version metadata in .exe
+    version=_version_file,
 )
 
 coll = COLLECT(
@@ -216,6 +247,11 @@ coll = COLLECT(
         'qwindows.dll',
         'onnxruntime*.dll',
         '_pybind_state*.pyd',
+        'cudnn*.dll',
+        'cublas*.dll',
+        'cufft*.dll',
+        'cudart*.dll',
+        'nvinfer*.dll',
     ],
     name='FaceUploaderApp v2.1.1',
 )
