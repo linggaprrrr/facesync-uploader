@@ -15,14 +15,16 @@ if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
 
     if getattr(sys, 'frozen', False):
         # ── Case B: frozen / PyInstaller bundle ──────────────────────────
-        _exe_dir = os.path.dirname(sys.executable)
+        # PyInstaller 6.x puts all files in  <exe_dir>\_internal\
+        # sys._MEIPASS always points to that directory (onedir or onefile).
+        _internal = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
 
         # onnxruntime capi dir (onnxruntime_providers_cuda.dll lives here)
-        _dll_dirs.append(os.path.join(_exe_dir, 'onnxruntime', 'capi'))
-        _dll_dirs.append(_exe_dir)
+        _dll_dirs.append(os.path.join(_internal, 'onnxruntime', 'capi'))
+        _dll_dirs.append(_internal)
 
-        # nvidia pip DLLs bundled into  <exe_dir>\nvidia\<pkg>\bin\
-        _nvidia = os.path.join(_exe_dir, 'nvidia')
+        # nvidia pip DLLs bundled into  _internal\nvidia\<pkg>\bin\
+        _nvidia = os.path.join(_internal, 'nvidia')
         if os.path.isdir(_nvidia):
             for _pkg in os.listdir(_nvidia):
                 _dll_dirs.append(os.path.join(_nvidia, _pkg, 'bin'))
@@ -83,9 +85,9 @@ def _find_cuda_provider_dll():
     candidates = []
 
     if getattr(sys, 'frozen', False):
-        _exe_dir = os.path.dirname(sys.executable)
+        _internal = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
         candidates.append(
-            os.path.join(_exe_dir, 'onnxruntime', 'capi',
+            os.path.join(_internal, 'onnxruntime', 'capi',
                          'onnxruntime_providers_cuda.dll')
         )
     else:
