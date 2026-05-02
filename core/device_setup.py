@@ -3,85 +3,69 @@ import sys
 import ctypes
 
 # ---------------------------------------------------------------------------
-# Windows: register DLL search directories AND pre-load cuDNN/cuBLAS DLLs
-# BEFORE importing onnxruntime, so Windows binds our bundled versions first.
+# Windows: make bundled CUDA/cuDNN DLLs findable BEFORE importing onnxruntime.
 #
-# Two cases:
-#   A) Running from source   → DLLs are in site-packages\nvidia\*\bin\
-#   B) Running as PyInstaller bundle → DLLs are in _internal\nvidia\*\bin\
+# IMPORTANT: os.add_dll_directory() only helps Python's own loader (.pyd files).
+# onnxruntime's C++ code calls LoadLibrary("cudnn64_9.dll") internally using
+# the standard Windows search order, which checks PATH — not add_dll_directory.
+# So we MUST prepend our nvidia\*\bin dirs to PATH as well.
 # ---------------------------------------------------------------------------
-if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
+if sys.platform == 'win32':
 
-    _dll_dirs = []
+    _nvidia_bins = []
 
     if getattr(sys, 'frozen', False):
-        # ── Case B: frozen / PyInstaller bundle ──────────────────────────
+        # PyInstaller 6.x: all files are under _internal\ (sys._MEIPASS)
         _internal = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
 
-        _dll_dirs.append(os.path.join(_internal, 'onnxruntime', 'capi'))
-        _dll_dirs.append(_internal)
+        # onnxruntime provider DLLs
+        _nvidia_bins.append(os.path.join(_internal, 'onnxruntime', 'capi'))
+        _nvidia_bins.append(_internal)
 
-        _nvidia = os.path.join(_internal, 'nvidia')
-        if os.path.isdir(_nvidia):
-            for _pkg in os.listdir(_nvidia):
-                _dll_dirs.append(os.path.join(_nvidia, _pkg, 'bin'))
-
+        # nvidia pip DLLs: cudnn, cublas, cudart, etc.
+        _nvidia_root = os.path.join(_internal, 'nvidia')
+        if os.path.isdir(_nvidia_root):
+            for _pkg in os.listdir(_nvidia_root):
+                _bin = os.path.join(_nvidia_root, _pkg, 'bin')
+                if os.path.isdir(_bin):
+                    _nvidia_bins.append(_bin)
     else:
-        # ── Case A: running from source / venv ───────────────────────────
         try:
             import site
             for _sp in site.getsitepackages():
-                _dll_dirs.append(os.path.join(_sp, 'onnxruntime', 'capi'))
-                _nvidia = os.path.join(_sp, 'nvidia')
-                if os.path.isdir(_nvidia):
-                    for _pkg in os.listdir(_nvidia):
-                        _dll_dirs.append(os.path.join(_nvidia, _pkg, 'bin'))
+                _nvidia_bins.append(os.path.join(_sp, 'onnxruntime', 'capi'))
+                _nvidia_root = os.path.join(_sp, 'nvidia')
+                if os.path.isdir(_nvidia_root):
+                    for _pkg in os.listdir(_nvidia_root):
+                        _bin = os.path.join(_nvidia_root, _pkg, 'bin')
+                        if os.path.isdir(_bin):
+                            _nvidia_bins.append(_bin)
         except Exception:
             pass
 
-    # System CUDA toolkit (cudart64_12.dll, etc.) — appended AFTER bundled dirs
-    # so bundled DLLs take precedence over system ones.
+    # System CUDA toolkit — appended AFTER bundled dirs so bundled wins
     _env_cuda = os.environ.get('CUDA_PATH') or os.environ.get('CUDA_HOME')
     if _env_cuda:
-        _dll_dirs.append(os.path.join(_env_cuda, 'bin'))
+        _nvidia_bins.append(os.path.join(_env_cuda, 'bin'))
     for _ver in ('12.8', '12.6', '12.4', '12.2', '12.0', '11.8'):
-        _dll_dirs.append(
+        _nvidia_bins.append(
             rf'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{_ver}\bin'
         )
 
-    # Register all valid dirs
-    _registered = []
-    for _d in _dll_dirs:
-        if os.path.isdir(_d):
+    # Filter to existing dirs only
+    _valid_bins = [d for d in _nvidia_bins if os.path.isdir(d)]
+
+    if hasattr(os, 'add_dll_directory'):
+        for _d in _valid_bins:
             try:
                 os.add_dll_directory(_d)
-                _registered.append(_d)
             except OSError:
                 pass
 
-    # Pre-load cuDNN + cuBLAS DLLs explicitly so Windows binds our versions
-    # before onnxruntime's CUDA provider tries to resolve them.
-    # Priority: load from registered dirs in order (bundled first).
-    _PRELOAD = [
-        # cuDNN 9.x (nvidia-cudnn-cu12 >= 9.x)
-        'cudnn64_9.dll',
-        # cuDNN 8.x fallback
-        'cudnn64_8.dll',
-        # cuBLAS (needed by onnxruntime CUDA provider)
-        'cublas64_12.dll',
-        'cublasLt64_12.dll',
-        # cudart (CUDA runtime)
-        'cudart64_12.dll',
-    ]
-    for _dll_name in _PRELOAD:
-        for _d in _registered:
-            _full = os.path.join(_d, _dll_name)
-            if os.path.isfile(_full):
-                try:
-                    ctypes.CDLL(_full)
-                except OSError:
-                    pass
-                break  # stop at first found for this DLL name
+    # Prepend to PATH so onnxruntime's internal LoadLibrary calls find our DLLs.
+    # This is the critical step — without it, onnxruntime searches only system PATH.
+    _extra = os.pathsep.join(_valid_bins)
+    os.environ['PATH'] = _extra + os.pathsep + os.environ.get('PATH', '')
 
 import onnxruntime as ort
 from dotenv import load_dotenv
