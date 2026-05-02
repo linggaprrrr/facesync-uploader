@@ -85,9 +85,12 @@ for pkg in [
 ]:
     try:
         subs = collect_submodules(pkg)
-        # Drop Emscripten/WebAssembly sub-modules — they require 'js'
-        # which only exists in browser environments.
-        subs = [s for s in subs if 'emscripten' not in s]
+        subs = [s for s in subs if not any(bad in s for bad in (
+            'emscripten',        # WebAssembly-only, needs 'js'
+            'onnxruntime.quantization',  # needs onnx package (excluded)
+            'onnxruntime.tools',         # needs onnx package (excluded)
+            'onnxruntime.training',      # needs onnx package (excluded)
+        ))]
         hiddenimports += subs
     except Exception:
         hiddenimports.append(pkg)
@@ -189,12 +192,16 @@ a = Analysis(
     excludes=[
         # WebAssembly-only — requires 'js' module that doesn't exist on Windows
         'urllib3.contrib.emscripten',
-        # onnx.reference crashes PyInstaller's analysis subprocess (0xC0000005).
-        # The onnx package is only used optionally in the CUDA probe in
-        # device_setup.py — it is not needed at runtime in the built app.
+        # onnx + any onnxruntime submodule that depends on it crash
+        # PyInstaller's analysis subprocess with 0xC0000005.
+        # onnx is only used optionally in device_setup.py and is not
+        # needed at runtime in the built app.
         'onnx',
         'onnx.reference',
         'onnx.backend',
+        'onnxruntime.quantization',
+        'onnxruntime.tools',
+        'onnxruntime.training',
         # Heavy ML frameworks not used by this app
         'tensorflow',
         'torch',
