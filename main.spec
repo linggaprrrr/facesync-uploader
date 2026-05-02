@@ -36,6 +36,11 @@ for pkg in [
     'insightface.app',
     'insightface.model_zoo',
     'insightface.utils',
+    'albumentations',
+    'scipy',
+    'scipy.ndimage',
+    'scipy.spatial',
+    'scipy.special',
     'requests',
     'urllib3',
     'urllib3.contrib',
@@ -124,6 +129,7 @@ for pkg in [
     'onnxruntime',
     'sqlalchemy',
     'insightface',
+    'albumentations',
     'botocore',
     'aiobotocore',
 ]:
@@ -147,6 +153,7 @@ for pkg in [
     'onnxruntime',
     'psycopg2',
     'numpy',
+    'scipy',
 ]:
     try:
         binaries += collect_dynamic_libs(pkg)
@@ -209,7 +216,6 @@ a = Analysis(
         'torchvision',
         'keras',
         'matplotlib',
-        'scipy',
         'pandas',
         'PIL.ImageTk',
         'tkinter',
