@@ -86,10 +86,12 @@ for pkg in [
     try:
         subs = collect_submodules(pkg)
         subs = [s for s in subs if not any(bad in s for bad in (
-            'emscripten',        # WebAssembly-only, needs 'js'
-            'onnxruntime.quantization',  # needs onnx package (excluded)
-            'onnxruntime.tools',         # needs onnx package (excluded)
-            'onnxruntime.training',      # needs onnx package (excluded)
+            'emscripten',           # WebAssembly-only, needs 'js'
+            'onnx.reference',       # crashes PyInstaller subprocess (0xC0000005)
+            'onnx.backend',         # same
+            'onnxruntime.quantization',
+            'onnxruntime.tools',
+            'onnxruntime.training',
         ))]
         hiddenimports += subs
     except Exception:
@@ -118,6 +120,7 @@ for _src, _dst in [
 for pkg in [
     'certifi',
     'aiohttp',
+    'onnx',
     'onnxruntime',
     'sqlalchemy',
     'insightface',
@@ -192,11 +195,9 @@ a = Analysis(
     excludes=[
         # WebAssembly-only — requires 'js' module that doesn't exist on Windows
         'urllib3.contrib.emscripten',
-        # onnx + any onnxruntime submodule that depends on it crash
-        # PyInstaller's analysis subprocess with 0xC0000005.
-        # onnx is only used optionally in device_setup.py and is not
-        # needed at runtime in the built app.
-        'onnx',
+        # onnx.reference crashes PyInstaller's analysis subprocess (0xC0000005).
+        # Exclude only the heavy optional sub-packages — insightface needs
+        # the core onnx package at runtime so we must keep it.
         'onnx.reference',
         'onnx.backend',
         'onnxruntime.quantization',
