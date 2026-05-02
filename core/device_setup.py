@@ -3,11 +3,12 @@ import sys
 import ctypes
 
 # ---------------------------------------------------------------------------
-# Windows: register DLL search directories BEFORE importing onnxruntime.
-# Two cases must be handled:
+# Windows: register DLL search directories AND pre-load cuDNN/cuBLAS DLLs
+# BEFORE importing onnxruntime, so Windows binds our bundled versions first.
+#
+# Two cases:
 #   A) Running from source   → DLLs are in site-packages\nvidia\*\bin\
-#   B) Running as PyInstaller bundle → DLLs are next to the .exe, under
-#      nvidia\<pkg>\bin\  (Windows won't search subdirectories by default)
+#   B) Running as PyInstaller bundle → DLLs are in _internal\nvidia\*\bin\
 # ---------------------------------------------------------------------------
 if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
 
@@ -15,15 +16,11 @@ if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
 
     if getattr(sys, 'frozen', False):
         # ── Case B: frozen / PyInstaller bundle ──────────────────────────
-        # PyInstaller 6.x puts all files in  <exe_dir>\_internal\
-        # sys._MEIPASS always points to that directory (onedir or onefile).
         _internal = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
 
-        # onnxruntime capi dir (onnxruntime_providers_cuda.dll lives here)
         _dll_dirs.append(os.path.join(_internal, 'onnxruntime', 'capi'))
         _dll_dirs.append(_internal)
 
-        # nvidia pip DLLs bundled into  _internal\nvidia\<pkg>\bin\
         _nvidia = os.path.join(_internal, 'nvidia')
         if os.path.isdir(_nvidia):
             for _pkg in os.listdir(_nvidia):
@@ -34,9 +31,7 @@ if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
         try:
             import site
             for _sp in site.getsitepackages():
-                # onnxruntime capi
                 _dll_dirs.append(os.path.join(_sp, 'onnxruntime', 'capi'))
-                # nvidia pip packages
                 _nvidia = os.path.join(_sp, 'nvidia')
                 if os.path.isdir(_nvidia):
                     for _pkg in os.listdir(_nvidia):
@@ -44,7 +39,8 @@ if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
         except Exception:
             pass
 
-    # System CUDA toolkit (cudart64_12.dll, etc.)
+    # System CUDA toolkit (cudart64_12.dll, etc.) — appended AFTER bundled dirs
+    # so bundled DLLs take precedence over system ones.
     _env_cuda = os.environ.get('CUDA_PATH') or os.environ.get('CUDA_HOME')
     if _env_cuda:
         _dll_dirs.append(os.path.join(_env_cuda, 'bin'))
@@ -53,19 +49,39 @@ if sys.platform == 'win32' and hasattr(os, 'add_dll_directory'):
             rf'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{_ver}\bin'
         )
 
-    # Common standalone cuDNN installs
-    _dll_dirs += [
-        r'C:\cudnn\bin',
-        r'C:\Program Files\NVIDIA\CUDNN\v9\bin',
-        r'C:\Program Files\NVIDIA\CUDNN\v8\bin',
-    ]
-
+    # Register all valid dirs
+    _registered = []
     for _d in _dll_dirs:
         if os.path.isdir(_d):
             try:
                 os.add_dll_directory(_d)
+                _registered.append(_d)
             except OSError:
                 pass
+
+    # Pre-load cuDNN + cuBLAS DLLs explicitly so Windows binds our versions
+    # before onnxruntime's CUDA provider tries to resolve them.
+    # Priority: load from registered dirs in order (bundled first).
+    _PRELOAD = [
+        # cuDNN 9.x (nvidia-cudnn-cu12 >= 9.x)
+        'cudnn64_9.dll',
+        # cuDNN 8.x fallback
+        'cudnn64_8.dll',
+        # cuBLAS (needed by onnxruntime CUDA provider)
+        'cublas64_12.dll',
+        'cublasLt64_12.dll',
+        # cudart (CUDA runtime)
+        'cudart64_12.dll',
+    ]
+    for _dll_name in _PRELOAD:
+        for _d in _registered:
+            _full = os.path.join(_d, _dll_name)
+            if os.path.isfile(_full):
+                try:
+                    ctypes.CDLL(_full)
+                except OSError:
+                    pass
+                break  # stop at first found for this DLL name
 
 import onnxruntime as ort
 from dotenv import load_dotenv
