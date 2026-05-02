@@ -219,8 +219,6 @@ a = Analysis(
         'pandas',
         'PIL.ImageTk',
         'tkinter',
-        'test',
-        'unittest',
         'pydoc',
         'doctest',
         'difflib',
