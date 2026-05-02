@@ -116,29 +116,9 @@ def _cuda_works() -> bool:
             print(f"⚠️  CUDA provider DLL load failed: {e}")
             return False
 
-    # Final check: create a real CUDA session with a conv-free op.
-    try:
-        import numpy as np
-        try:
-            import onnx
-            from onnx import helper, TensorProto
-            X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1])
-            Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1])
-            node = helper.make_node('Identity', ['X'], ['Y'])
-            graph = helper.make_graph([node], 'probe', [X], [Y])
-            model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 11)])
-            model.ir_version = 7   # onnxruntime 1.19/1.20 supports up to IR 10
-            sess = ort.InferenceSession(
-                model.SerializeToString(),
-                providers=['CUDAExecutionProvider'],
-            )
-            sess.run(None, {'X': np.zeros((1,), dtype=np.float32)})
-        except ImportError:
-            pass  # onnx not installed — DLL check above is sufficient
-        return True
-    except Exception as e:
-        print(f"⚠️  CUDA session probe failed: {e}")
-        return False
+    # DLL load check above is sufficient — the onnx package is not bundled
+    # in the built app (excluded from PyInstaller), so we don't use it here.
+    return True
 
 
 if _cuda_works():

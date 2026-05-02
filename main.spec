@@ -38,6 +38,7 @@ for pkg in [
     'insightface.utils',
     'requests',
     'urllib3',
+    'urllib3.contrib',
     'certifi',
     'charset_normalizer',
     'idna',
@@ -83,7 +84,11 @@ for pkg in [
     'pkg_resources._vendor',
 ]:
     try:
-        hiddenimports += collect_submodules(pkg)
+        subs = collect_submodules(pkg)
+        # Drop Emscripten/WebAssembly sub-modules — they require 'js'
+        # which only exists in browser environments.
+        subs = [s for s in subs if 'emscripten' not in s]
+        hiddenimports += subs
     except Exception:
         hiddenimports.append(pkg)
 
@@ -182,6 +187,15 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # WebAssembly-only — requires 'js' module that doesn't exist on Windows
+        'urllib3.contrib.emscripten',
+        # onnx.reference crashes PyInstaller's analysis subprocess (0xC0000005).
+        # The onnx package is only used optionally in the CUDA probe in
+        # device_setup.py — it is not needed at runtime in the built app.
+        'onnx',
+        'onnx.reference',
+        'onnx.backend',
+        # Heavy ML frameworks not used by this app
         'tensorflow',
         'torch',
         'torchvision',
