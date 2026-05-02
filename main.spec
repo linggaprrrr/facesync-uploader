@@ -91,14 +91,21 @@ hiddenimports = sorted(set(hiddenimports))
 
 # ---------------------------------------------------------------------------
 # Data files — package assets bundled into the distribution
+# SPECPATH is set by PyInstaller to the directory containing this .spec file.
 # ---------------------------------------------------------------------------
-datas = [
-    ('assets',  'assets'),
-    ('ui',      'ui'),
-    ('core',    'core'),
-    ('utils',   'utils'),
-    ('models',  'models'),
-]
+datas = []
+for _src, _dst in [
+    ('assets', 'assets'),
+    ('ui',     'ui'),
+    ('core',   'core'),
+    ('utils',  'utils'),
+    ('models', 'models'),
+]:
+    _full = os.path.join(SPECPATH, _src)
+    if os.path.isdir(_full):
+        datas.append((_full, _dst))
+    else:
+        print(f'WARNING: skipping missing folder: {_full}')
 
 for pkg in [
     'certifi',
@@ -166,8 +173,8 @@ except Exception:
 # Analysis
 # ---------------------------------------------------------------------------
 a = Analysis(
-    ['main.py'],
-    pathex=['.'],
+    [os.path.join(SPECPATH, 'main.py')],
+    pathex=[SPECPATH],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -198,7 +205,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-_version_file = 'version_info.txt' if os.path.isfile('version_info.txt') else None
+_version_file = os.path.join(SPECPATH, 'version_info.txt')
+_version_file = _version_file if os.path.isfile(_version_file) else None
+
+_icon_file = os.path.join(SPECPATH, 'assets', 'ownize_logo.ico')
 
 exe = EXE(
     pyz,
@@ -227,7 +237,7 @@ exe = EXE(
         'nvinfer*.dll',
     ],
     console=False,
-    icon='assets/ownize_logo.ico',
+    icon=_icon_file,
     version=_version_file,
 )
 
