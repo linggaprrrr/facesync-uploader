@@ -14,7 +14,6 @@ env/
 # PyInstaller
 build/
 dist/
-*.spec
 
 # Local config & secrets
 .env
@@ -24,7 +23,6 @@ app_config.json
 # Large binary / generated folders
 fr-uploader/
 models/
-assets/
 
 # VSCode / IDE
 .vscode/

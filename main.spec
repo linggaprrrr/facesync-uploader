@@ -229,7 +229,16 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 _version_file = os.path.join(SPECPATH, 'version_info.txt')
 _version_file = _version_file if os.path.isfile(_version_file) else None
 
-_icon_file = os.path.join(SPECPATH, 'assets', 'ownize_logo.ico')
+# Prefer .ico, fall back to .png (PyInstaller auto-converts), then no icon.
+_icon_file = None
+for _icon_candidate in (
+    os.path.join(SPECPATH, 'assets', 'ownize_logo.ico'),
+    os.path.join(SPECPATH, 'assets', 'ownize_logo.png'),
+    os.path.join(SPECPATH, 'assets', 'ownize_logo_2.png'),
+):
+    if os.path.isfile(_icon_candidate):
+        _icon_file = _icon_candidate
+        break
 
 exe = EXE(
     pyz,
