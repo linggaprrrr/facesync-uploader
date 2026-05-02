@@ -159,7 +159,7 @@ else:
         "   Full fix (if above still fails):\n"
         "     1. Download cuDNN 9.x for CUDA 12 from https://developer.nvidia.com/cudnn\n"
         "     2. Copy cuDNN bin\\ DLLs into:\n"
-        r"        C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\"
+        r"        C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
 
 face_app = FaceAnalysis(name='buffalo_l', providers=_providers)
