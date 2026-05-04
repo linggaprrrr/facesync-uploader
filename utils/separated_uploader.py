@@ -252,71 +252,73 @@ class SeparatedUploadManager:
 
         async def upload_data_batch(batch_items: List[Dict], start_idx: int, batch_num: int):
             async with semaphore:
-                try:
-                    logger.info(f"📤 Data batch {batch_num}: {len(batch_items)} items")
+                logger.info(f"📤 Data batch {batch_num}: {len(batch_items)} items")
 
-                    photos_payload = []
-                    for item in batch_items:
-                        photo_data = {
-                            "unit_code": item["unit_id"],
-                            "outlet_code": item["outlet_id"],
-                            "photo_type_code": item["photo_type_id"],
-                            "filename": Path(item["file_path"]).name,
-                            "faces": [
-                                {
-                                    "embedding": face["embedding"],
-                                    "bbox": face["bbox"],
-                                    "confidence": face["confidence"],
-                                }
-                                for face in item["faces_data"]
-                            ],
-                        }
-                        photos_payload.append(photo_data)
+                photos_payload = []
+                for item in batch_items:
+                    photo_data = {
+                        "unit_code": item["unit_id"],
+                        "outlet_code": item["outlet_id"],
+                        "photo_type_code": item["photo_type_id"],
+                        "filename": Path(item["file_path"]).name,
+                        "faces": [
+                            {
+                                "embedding": face["embedding"],
+                                "bbox": face["bbox"],
+                                "confidence": face["confidence"],
+                            }
+                            for face in item["faces_data"]
+                        ],
+                    }
+                    photos_payload.append(photo_data)
 
-                    url = f"{self.config.api_base_url}/faces/upload-data"
+                url = f"{self.config.api_base_url}/faces/upload-data"
 
-                    async with self.session.post(
-                        url,
-                        json={"photos": photos_payload},
-                        timeout=aiohttp.ClientTimeout(total=self.config.timeout_data),
-                    ) as response:
+                for attempt in range(self.config.retry_attempts):
+                    try:
+                        async with self.session.post(
+                            url,
+                            json={"photos": photos_payload},
+                            timeout=aiohttp.ClientTimeout(total=self.config.timeout_data),
+                        ) as response:
 
-                        if response.status == 200:
-                            result = await response.json()
-                            photo_ids = [str(pid) for pid in result.get("photo_ids", [])]
+                            if response.status == 200:
+                                result = await response.json()
+                                photo_ids = [str(pid) for pid in result.get("photo_ids", [])]
 
-                            # The backend returns IDs only for successfully inserted photos,
-                            # in the same order as the successfully validated input photos.
-                            # We match them positionally — failures simply have no entry.
-                            index_map: Dict[int, str] = {}
-                            server_idx = 0
-                            for local_idx, item in enumerate(batch_items):
-                                if server_idx < len(photo_ids):
-                                    # Detect a server-side skip by comparing filenames if
-                                    # the backend echoes them; otherwise assume in-order.
-                                    index_map[start_idx + local_idx] = photo_ids[server_idx]
-                                    server_idx += 1
+                                index_map: Dict[int, str] = {}
+                                server_idx = 0
+                                for local_idx, item in enumerate(batch_items):
+                                    if server_idx < len(photo_ids):
+                                        index_map[start_idx + local_idx] = photo_ids[server_idx]
+                                        server_idx += 1
 
-                            logger.info(
-                                f"✅ Data batch {batch_num}: {len(index_map)}/{len(batch_items)} photos"
-                            )
-                            if progress_callback:
-                                progress_callback(
-                                    f"Data batch {batch_num} completed",
-                                    len(global_index_map) + len(index_map),
-                                    len(photos_data),
+                                logger.info(
+                                    f"✅ Data batch {batch_num}: {len(index_map)}/{len(batch_items)} photos"
                                 )
-                            return index_map
-                        else:
-                            error_text = await response.text()
-                            logger.error(
-                                f"❌ Data batch {batch_num} failed: {response.status} - {error_text}"
-                            )
-                            return {}
+                                if progress_callback:
+                                    progress_callback(
+                                        f"Data batch {batch_num} completed",
+                                        len(global_index_map) + len(index_map),
+                                        len(photos_data),
+                                    )
+                                return index_map
+                            else:
+                                error_text = await response.text()
+                                logger.error(
+                                    f"❌ Data batch {batch_num} failed (attempt {attempt + 1}): {response.status} - {error_text}"
+                                )
 
-                except Exception as e:
-                    logger.error(f"❌ Data batch {batch_num} error: {e}")
-                    return {}
+                    except Exception as e:
+                        logger.error(f"❌ Data batch {batch_num} error (attempt {attempt + 1}): {e}")
+
+                    if attempt < self.config.retry_attempts - 1:
+                        delay = self.config.retry_delay * (2 ** attempt)
+                        logger.info(f"🔄 Retrying data batch {batch_num} in {delay:.1f}s...")
+                        await asyncio.sleep(delay)
+
+                logger.error(f"❌ Data batch {batch_num} failed after {self.config.retry_attempts} attempts")
+                return {}
 
         tasks = [
             upload_data_batch(batch_items, start_idx, i + 1)
@@ -468,11 +470,14 @@ class SeparatedUploadManager:
         check_count = 0
         start_time = time.time()  # NEW: Track total time
         
+        # Scale timeout with batch size: 2s minimum, +0.5s per photo
+        effective_timeout = max(self.config.status_timeout, len(photo_ids) * 0.5)
+        logger.info(f"⏳ Status timeout set to {effective_timeout:.1f}s for {len(photo_ids)} photos")
+
         while pending_ids and check_count < self.config.max_status_checks:
-            # NEW: Add timeout protection
             elapsed_time = time.time() - start_time
-            if elapsed_time > self.config.status_timeout:
-                logger.warning(f"⏰ Status check timeout ({elapsed_time:.1f}s), assuming success for {len(pending_ids)} remaining photos")
+            if elapsed_time > effective_timeout:
+                logger.warning(f"⏰ Status check timeout ({elapsed_time:.1f}s / {effective_timeout:.1f}s), assuming success for {len(pending_ids)} remaining photos")
                 break
             
             check_count += 1
