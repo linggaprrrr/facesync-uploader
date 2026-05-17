@@ -26,7 +26,7 @@ class UploadConfig:
     batch_size_files: int = 10
     retry_attempts: int = 3
     retry_delay: float = 1.0
-    timeout_data: int = 30
+    timeout_data: int = 120   # raised from 30 — 14 files × 7 faces was already hitting 30s
     timeout_files: int = 120
     status_check_interval: float = 0.3  # CHANGED: Was 2.0
     max_status_checks: int = 10         # CHANGED: Was 30
@@ -310,7 +310,9 @@ class SeparatedUploadManager:
                                 )
 
                     except Exception as e:
-                        logger.error(f"❌ Data batch {batch_num} error (attempt {attempt + 1}): {e}")
+                        # repr(e) shows the exception type even when str(e) is empty
+                        # e.g. asyncio.TimeoutError stringifies to '' but repr shows the class
+                        logger.error(f"❌ Data batch {batch_num} error (attempt {attempt + 1}): {repr(e)}")
 
                     if attempt < self.config.retry_attempts - 1:
                         delay = self.config.retry_delay * (2 ** attempt)
@@ -596,6 +598,72 @@ class SeparatedUploadManager:
         
         logger.info(f"✅ Created {len(results)} immediate success results")
         return results
+
+
+# ===== STREAMING PIPELINE =====
+
+class StreamingUploadPipeline:
+    """
+    Solves the 1000-file bottleneck where all files must be embedded before
+    any upload starts.
+
+    Usage pattern (inside a worker thread):
+        pipeline = StreamingUploadPipeline(api_base_url, auth_token)
+
+        for chunk of EMBED_BATCH files:
+            embed the chunk (sequential, _inference_lock)
+            pipeline.submit_batch(embedded_chunk)   # non-blocking
+
+        results = pipeline.wait_all()               # collect everything
+
+    The upload thread pool runs concurrently with the embedding loop, so
+    batch N+1 is uploaded while batch N is still being embedded.
+    """
+
+    def __init__(self, api_base_url: str = API_BASE, auth_token: str = None,
+                 max_upload_threads: int = 2):
+        self.api_base_url = api_base_url
+        self.auth_token = auth_token
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_upload_threads,
+            thread_name_prefix="StreamUpload"
+        )
+        self._futures: list = []
+        self._batch_counter = 0
+
+    def submit_batch(self, photos_data: List[Dict[str, Any]]) -> None:
+        """
+        Non-blocking: send an already-embedded mini-batch to the upload thread pool.
+        Returns immediately — embedding of the next batch can start right away.
+        """
+        if not photos_data:
+            return
+        self._batch_counter += 1
+        batch_num = self._batch_counter
+        logger.info(f"📨 Streaming pipeline: queueing upload batch {batch_num} ({len(photos_data)} files)")
+
+        def _run(data, num):
+            manager = SeparatedUploadManager(self.api_base_url, auth_token=self.auth_token)
+            return manager.upload_photos_sync(data, progress_callback=None)
+
+        future = self._executor.submit(_run, photos_data, batch_num)
+        self._futures.append(future)
+
+    def wait_all(self) -> List[UploadResult]:
+        """
+        Block until all submitted batches finish uploading.
+        Returns the flat list of UploadResult across all batches.
+        """
+        all_results: List[UploadResult] = []
+        for future in self._futures:
+            try:
+                batch_results = future.result()
+                if isinstance(batch_results, list):
+                    all_results.extend(batch_results)
+            except Exception as e:
+                logger.error(f"❌ Streaming pipeline batch failed: {e}")
+        self._executor.shutdown(wait=False)
+        return all_results
 
 
 # ===== INTEGRATION FUNCTIONS =====

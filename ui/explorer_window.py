@@ -34,7 +34,7 @@ except ImportError as e:
     print(f"⚠️ Speed detector not available: {e}")
    
 
-from utils.separated_uploader import SeparatedUploadManager, UploadResult
+from utils.separated_uploader import SeparatedUploadManager, UploadResult, StreamingUploadPipeline
 
 # Import with try-except to avoid errors
 try:
@@ -75,100 +75,122 @@ class SeparatedUploadWorker(QRunnable):
         self.auth_token = auth_token
         self.signals = SeparatedUploadWorkerSignals()
         
+    # How many files to embed before dispatching a batch to the upload pipeline.
+    EMBED_BATCH_SIZE = 15
+
     def run(self):
-        """Run the separated upload process"""
+        """
+        Streaming pipeline: embed EMBED_BATCH_SIZE files, dispatch for upload
+        immediately, then embed the next chunk — overlapping embedding and
+        uploading instead of doing all embedding first.
+
+        Before: embed(1000 files) → upload(1000 files)   [sequential]
+        After:  embed(15) | upload(prev 15) | embed(15) | upload(prev 15) ...
+        """
         try:
-            thread_name = f"Worker-{len(self.files_list)}"
-            logger.info(f"🚀 [{thread_name}] Starting upload: {len(self.files_list)} files")
-            
-            # Progress callback
-            def progress_callback(message: str, current: int, total: int):
-                self.signals.progress.emit(message, f"{current}/{total}")
-                self.signals.upload_progress.emit(current, total)
-            
-            # Process files and extract face data
-            self.signals.progress.emit("Processing faces...", "0/0")
-            photos_data = []
+            total = len(self.files_list)
+            logger.info(f"🚀 Streaming pipeline starting: {total} files, "
+                        f"embed_batch={self.EMBED_BATCH_SIZE}")
+
+            pipeline = StreamingUploadPipeline(
+                self.api_base_url,
+                auth_token=self.auth_token,
+                max_upload_threads=2,
+            )
+
+            embed_buffer: list = []   # accumulates embedded photos for one mini-batch
             processing_errors = 0
-            
+            dispatched_total = 0
+
+            self.signals.progress.emit("Processing faces...", f"0/{total}")
+
             for i, file_path in enumerate(self.files_list):
+                filename = os.path.basename(file_path)
+                self.signals.progress.emit(
+                    f"Embedding {filename}",
+                    f"{i + 1}/{total}"
+                )
+
                 try:
-                    filename = os.path.basename(file_path)
-                    self.signals.progress.emit(f"Processing {filename}", f"{i+1}/{len(self.files_list)}")
-                    
-                    # Process faces in image
                     faces = process_faces_in_image_optimized(file_path)
-                    
+
                     if not faces:
                         processing_errors += 1
                         self.signals.error.emit(file_path, "No faces detected")
                         continue
-                    
-                    # Parse path codes
+
                     relative_path = self._get_relative_path(file_path)
                     if not relative_path:
                         processing_errors += 1
                         self.signals.error.emit(file_path, "Invalid path")
                         continue
-                    
+
                     unit_code, outlet_code, photo_type_code = self._parse_codes_from_path(relative_path)
                     if not all([unit_code, outlet_code, photo_type_code]):
                         processing_errors += 1
                         self.signals.error.emit(file_path, "Path parsing failed")
                         continue
-                    
-                    # Convert codes to IDs (you'll need to implement this based on your system)
+
                     unit_id, outlet_id, photo_type_id = self._resolve_codes_to_ids(
                         unit_code, outlet_code, photo_type_code
                     )
-                    
-                    photo_data = {
+
+                    embed_buffer.append({
                         'file_path': file_path,
                         'unit_id': unit_id,
                         'outlet_id': outlet_id,
                         'photo_type_id': photo_type_id,
-                        'faces_data': faces
-                    }
-                    photos_data.append(photo_data)
-                    
+                        'faces_data': faces,
+                    })
+
                 except Exception as e:
                     processing_errors += 1
                     self.signals.error.emit(file_path, f"Processing error: {str(e)}")
-            
-            if not photos_data:
-                self.signals.finished.emit("No valid photos to upload", False, "All files failed processing")
-                return
-            
-            # Use separated upload manager
-            if SeparatedUploadManager:
-                self.signals.progress.emit("Starting upload...", "0/0")
+                    continue
 
-                upload_manager = SeparatedUploadManager(self.api_base_url, auth_token=self.auth_token)
-                results = upload_manager.upload_photos_sync(photos_data, progress_callback)
-                
-                # Process results
-                successful = len([r for r in results if r.success])
-                failed = len([r for r in results if not r.success])
-                
-                success_rate = (successful / len(results)) * 100 if results else 0
-                
-                if successful > 0:
-                    message = f"Upload: {successful}/{len(results)} successful ({success_rate:.1f}%)"
-                    self.signals.finished.emit(message, True, message)
-                else:
-                    message = f"Upload failed: 0/{len(results)} successful"
-                    self.signals.finished.emit(message, False, message)
-                
-                self.signals.batch_completed.emit(successful, failed)
-                
+                # When the buffer is full, dispatch immediately and start the next chunk.
+                # The upload runs in a background thread — embedding continues right away.
+                if len(embed_buffer) >= self.EMBED_BATCH_SIZE:
+                    dispatched_total += len(embed_buffer)
+                    self.signals.progress.emit(
+                        f"Uploading batch ({dispatched_total}/{total})...",
+                        f"{dispatched_total}/{total}"
+                    )
+                    pipeline.submit_batch(embed_buffer.copy())
+                    embed_buffer.clear()
+
+            # Dispatch any remaining files that didn't fill a full batch
+            if embed_buffer:
+                dispatched_total += len(embed_buffer)
+                pipeline.submit_batch(embed_buffer.copy())
+                embed_buffer.clear()
+
+            if dispatched_total == 0:
+                self.signals.finished.emit(
+                    "No valid photos to upload", False, "All files failed processing"
+                )
+                return
+
+            # Wait for all upload threads to finish and collect results
+            self.signals.progress.emit("Waiting for uploads to finish...", f"{dispatched_total}/{total}")
+            results = pipeline.wait_all()
+
+            successful = len([r for r in results if r.success])
+            failed = len([r for r in results if not r.success])
+            success_rate = (successful / len(results)) * 100 if results else 0
+
+            if successful > 0:
+                message = (f"Upload: {successful}/{len(results)} successful "
+                           f"({success_rate:.1f}%), {processing_errors} embed errors")
+                self.signals.finished.emit(message, True, message)
             else:
-                # Fallback to old system
-                self.signals.progress.emit("Using fallback upload...", "0/0")
-                # Implement fallback if needed
-                self.signals.finished.emit("Fallback upload not implemented", False, "SeparatedUploadManager not available")
-                
+                message = f"Upload failed: 0/{len(results)} successful"
+                self.signals.finished.emit(message, False, message)
+
+            self.signals.batch_completed.emit(successful, failed)
+
         except Exception as e:
-            logger.error(f"❌ upload worker error: {e}")
+            logger.error(f"❌ Streaming upload worker error: {e}")
             self.signals.error.emit("batch", f"Worker error: {str(e)}")
             self.signals.finished.emit("Upload failed", False, str(e))
     
