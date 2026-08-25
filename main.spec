@@ -36,6 +36,11 @@ for pkg in [
     except Exception:
         hiddenimports.append(pkg)
 
+# Top-level project modules. ui/core/utils are copied as datas below, but root
+# modules have no such entry — they reach the exe only via import analysis, so
+# name them explicitly rather than trusting the walk.
+hiddenimports += ['file_filters', 'index_map']
+
 hiddenimports = sorted(set(hiddenimports))
 
 # ---------------------------------------------------------------------------
