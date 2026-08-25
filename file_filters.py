@@ -12,6 +12,15 @@ import os
 DERIVED_PREFIXES = ('thumb_', 'thumbnail_')
 VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.3gp', '.m4v')
 
+# The camera's wifi transfer app writes a downscaled copy beside the original:
+# IMG_5790_20250607_103144_3600.JPG next to IMG_5790_20250607_103144.JPG. Only
+# skipped when that original is actually there — a lone _3600 is the only copy
+# of that shot and must still be sold.
+# ponytail: resolved against the folder as it is right now. If the transfer app
+# writes the derivative first and the original lands seconds later, both get
+# ingested. Compare on file stem inside the uploader's batch if that shows up.
+RESIZED_SUFFIXES = ('_3600',)
+
 
 def is_derived_file(filename: str) -> bool:
     """True for thumbnails and video poster frames — skip, don't upload."""
@@ -21,4 +30,28 @@ def is_derived_file(filename: str) -> bool:
         return True
     # '.mp4.jpg' → the stem still carries a video extension
     stem = os.path.splitext(name)[0]
-    return os.path.splitext(stem)[1] in VIDEO_EXTENSIONS
+    if os.path.splitext(stem)[1] in VIDEO_EXTENSIONS:
+        return True
+
+    return any(
+        stem.endswith(suffix) and _original_exists(filename, suffix)
+        for suffix in RESIZED_SUFFIXES
+    )
+
+
+def _original_exists(path: str, suffix: str) -> bool:
+    """Is the un-suffixed original next to this file?
+
+    Returns False for a bare filename with no directory — nothing to check
+    against, so the file is kept.
+    """
+    folder = os.path.dirname(path)
+    if not folder:
+        return False
+    stem, ext = os.path.splitext(os.path.basename(path))
+    original = stem[: -len(suffix)]
+    # The transfer app is inconsistent about .JPG vs .jpg.
+    return any(
+        os.path.exists(os.path.join(folder, original + e))
+        for e in {ext, ext.lower(), ext.upper()}
+    )
