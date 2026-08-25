@@ -6,6 +6,8 @@ from watchdog.events import FileSystemEventHandler
 import os
 from datetime import datetime
 
+from file_filters import is_derived_file
+
 class OptimizedFolderWatcher(FileSystemEventHandler):
     """High-performance folder watcher with duplicate prevention"""
     
@@ -55,9 +57,15 @@ class OptimizedFolderWatcher(FileSystemEventHandler):
             print(f"❌ Error scanning existing files: {e}")
 
     def _is_image_file(self, filename):
-        """Check if file is an image"""
+        """Check if file is an image we should ingest.
+
+        Every discovery path goes through here, so the derived-file guard only
+        needs to exist once. Thumbnails and video poster frames carry the same
+        face as the real photo and were being uploaded, embedded and priced as
+        separate items.
+        """
         ext = os.path.splitext(filename)[1].lower()
-        return ext in self.image_extensions
+        return ext in self.image_extensions and not is_derived_file(filename)
 
     def _optimized_periodic_scan(self):
         """Optimized periodic scan with better performance"""
