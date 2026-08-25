@@ -48,8 +48,8 @@ class OptimizedFolderWatcher(FileSystemEventHandler):
             with self.lock:
                 for root, dirs, files in os.walk(self.folder_path):
                     for file in files:
-                        if self._is_image_file(file):
-                            file_path = os.path.join(root, file)
+                        file_path = os.path.join(root, file)
+                        if self._is_image_file(file_path):
                             if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                                 self.processed_files.add(file_path)
                                 
@@ -85,9 +85,9 @@ class OptimizedFolderWatcher(FileSystemEventHandler):
             
             for root, dirs, files in os.walk(self.folder_path):
                 for file in files:
-                    if self._is_image_file(file):
-                        file_path = os.path.join(root, file)
-                        
+                    file_path = os.path.join(root, file)
+                    if self._is_image_file(file_path):
+
                         if not os.path.exists(file_path):
                             continue
                             
