@@ -8,6 +8,7 @@ import time
 import threading
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Callable
+from index_map import build_index_map
 from dataclasses import dataclass
 from uuid import UUID
 import aiofiles
@@ -286,12 +287,17 @@ class SeparatedUploadManager:
                                 result = await response.json()
                                 photo_ids = [str(pid) for pid in result.get("photo_ids", [])]
 
-                                index_map: Dict[int, str] = {}
-                                server_idx = 0
-                                for local_idx, item in enumerate(batch_items):
-                                    if server_idx < len(photo_ids):
-                                        index_map[start_idx + local_idx] = photo_ids[server_idx]
-                                        server_idx += 1
+                                photo_indexes = result.get("photo_indexes") or []
+                                index_map = build_index_map(
+                                    start_idx, len(batch_items), photo_ids, photo_indexes
+                                )
+                                if index_map is None:
+                                    logger.error(
+                                        f"❌ Data batch {batch_num}: server returned "
+                                        f"{len(photo_ids)} ids for {len(batch_items)} photos "
+                                        "with no photo_indexes — cannot map safely, skipping batch"
+                                    )
+                                    return {}
 
                                 logger.info(
                                     f"✅ Data batch {batch_num}: {len(index_map)}/{len(batch_items)} photos"
@@ -374,30 +380,37 @@ class SeparatedUploadManager:
                 try:
                     logger.info(f"📁 File batch {batch_num}: {len(batch_items)} files")
                     
-                    # Prepare multipart data
+                    # Prepare multipart data. Files first: the server 400s the
+                    # WHOLE batch when len(files) != len(photo_ids), so an id may
+                    # only be sent once its file has actually been read.
                     data = aiohttp.FormData()
-                    
-                    # Add photo IDs
-                    for photo_id in batch_photo_ids:
-                        data.add_field('photo_ids', photo_id)
-                    
-                    # Add files
-                    for item in batch_items:
+                    sent_ids = []
+
+                    for photo_id, item in zip(batch_photo_ids, batch_items):
                         try:
                             file_path = item['file_path']
                             filename = Path(file_path).name
-                            
+
                             async with aiofiles.open(file_path, 'rb') as f:
                                 file_content = await f.read()
-                                data.add_field(
-                                    'files',
-                                    file_content,
-                                    filename=filename,
-                                    content_type='image/jpeg'
-                                )
                         except Exception as e:
                             logger.error(f"❌ Failed to read file {item['file_path']}: {e}")
                             continue
+
+                        data.add_field(
+                            'files',
+                            file_content,
+                            filename=filename,
+                            content_type='image/jpeg'
+                        )
+                        sent_ids.append(photo_id)
+
+                    if not sent_ids:
+                        logger.error(f"❌ File batch {batch_num}: no readable files, skipping")
+                        return
+
+                    for photo_id in sent_ids:
+                        data.add_field('photo_ids', photo_id)
                     
                     # Upload files
                     url = f"{self.config.api_base_url}/faces/upload-files"
