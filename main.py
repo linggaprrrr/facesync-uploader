@@ -1,15 +1,12 @@
 import sys
 import os
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QMessageBox, QDialog
+    QApplication, QMessageBox, QDialog, QSplashScreen
 )
-from ui.admin_setup_dialogs import AdminSetupDialog
-from ui.admin_login import AdminLoginDialog
-from ui.config_manager import ConfigManager
-from ui.explorer_window import ExplorerWindow
-
-# UPDATED: Import your optimized face detection module
+# ponytail: ui.* imports are deferred to MainApplication.__init__ so the
+# splash can paint before cv2/numpy/aiohttp/etc. are loaded.
 
 import logging
 
@@ -28,13 +25,42 @@ class MainApplication:
         self.app = QApplication(sys.argv)
         
         # Set logo aplikasi
-        logo_path = os.path.join(os.path.dirname(__file__), "assets", "ownize_logo_2.png")
-        self.app.setWindowIcon(QIcon(logo_path))
-        
+        # ponytail: small assets on purpose — ownize_logo*.png are 11810px and
+        # take ~550 MB + seconds to decode just for an icon.
+        assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+        self.app.setWindowIcon(QIcon(os.path.join(assets, "ownize_logo.ico")))
+
+        # Loader: paint before any heavy import
+        self.splash = QSplashScreen(
+            QPixmap(os.path.join(assets, "splash.png")), Qt.WindowStaysOnTopHint
+        )
+        self.splash.show()
+        self._status("Memuat model wajah...")
+
+        # Face model loads in the background (CUDA init is the slow part)
+        from core.device_setup import warmup_async
+        warmup_async()
+
+        self._status("Memuat antarmuka...")
+        global AdminSetupDialog, AdminLoginDialog, ExplorerWindow
+        from ui.admin_setup_dialogs import AdminSetupDialog
+        from ui.admin_login import AdminLoginDialog
+        from ui.config_manager import ConfigManager
+        from ui.explorer_window import ExplorerWindow
+
         self.config_manager = ConfigManager()
         self.main_window = None
         self.face_detection_initialized = False
         
+    def _status(self, text):
+        self.splash.showMessage(text, Qt.AlignBottom | Qt.AlignHCenter, Qt.darkGray)
+        self.app.processEvents()
+
+    def _close_splash(self):
+        if self.splash:
+            self.splash.close()
+            self.splash = None
+
     def initialize_systems(self):
         """Initialize all application systems"""
         try:
@@ -58,6 +84,7 @@ class MainApplication:
         """Cleanup all application systems"""
         try:
             logger.info("🔄 Starting application cleanup...")
+            self._close_splash()
             
             # Close main window if open
             if self.main_window:
@@ -76,6 +103,8 @@ class MainApplication:
             # STEP 1: Initialize all systems FIRST
             if not self.initialize_systems():
                 return 1  # Exit with error code
+
+            self._close_splash()  # dialogs below take over from the loader
             
             # STEP 2: Check if app is configured
             if not self.config_manager.is_configured():

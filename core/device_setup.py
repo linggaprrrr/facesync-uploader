@@ -1,6 +1,5 @@
 import os
 import sys
-import ctypes
 
 # ---------------------------------------------------------------------------
 # Windows: make bundled CUDA/cuDNN DLLs findable BEFORE importing onnxruntime.
@@ -67,78 +66,55 @@ if sys.platform == 'win32':
     _extra = os.pathsep.join(_valid_bins)
     os.environ['PATH'] = _extra + os.pathsep + os.environ.get('PATH', '')
 
-import onnxruntime as ort
+import threading
 from dotenv import load_dotenv
-from insightface.app import FaceAnalysis
 
 load_dotenv()
 
 API_BASE = os.getenv('BASE_URL', 'https://api.ownize.app')
 
-
 # ---------------------------------------------------------------------------
-# Device probe
+# Face model — loaded lazily. Importing onnxruntime/insightface and building
+# CUDA sessions takes seconds (worse on Windows), so it must not run at import
+# time. main.py calls warmup_async() so it loads while the login dialog is up.
 # ---------------------------------------------------------------------------
-
-def _find_cuda_provider_dll():
-    """Find onnxruntime_providers_cuda.dll in the current environment."""
-    candidates = []
-
-    if getattr(sys, 'frozen', False):
-        _internal = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        candidates.append(
-            os.path.join(_internal, 'onnxruntime', 'capi',
-                         'onnxruntime_providers_cuda.dll')
-        )
-    else:
-        try:
-            import site
-            for sp in site.getsitepackages():
-                candidates.append(
-                    os.path.join(sp, 'onnxruntime', 'capi',
-                                 'onnxruntime_providers_cuda.dll')
-                )
-        except Exception:
-            pass
-
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
+_face_app = None
+_face_lock = threading.Lock()
 
 
-def _cuda_works():
-    try:
-        available = ort.get_available_providers()
-    except AttributeError:
-        print("❌ onnxruntime conflict — run: pip uninstall onnxruntime onnxruntime-gpu -y && pip install onnxruntime-gpu==1.20.1")
-        return False
+def get_face_app():
+    """Return the shared FaceAnalysis, loading it on first call (thread-safe)."""
+    global _face_app
+    with _face_lock:
+        if _face_app is None:
+            import onnxruntime as ort  # must stay after the PATH setup above
+            from insightface.app import FaceAnalysis
 
-    if 'CUDAExecutionProvider' not in available:
-        return False
+            if 'CUDAExecutionProvider' in ort.get_available_providers():
+                ctx_id = 0
+                # HEURISTIC skips cuDNN's per-conv benchmark on first inference
+                providers = [
+                    ('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'HEURISTIC'}),
+                    'CPUExecutionProvider',
+                ]
+            else:
+                ctx_id, providers = -1, ['CPUExecutionProvider']
+                print("⚠️  CUDA unavailable — running on CPU.")
 
-    dll_path = _find_cuda_provider_dll()
-    if dll_path:
-        try:
-            ctypes.CDLL(dll_path)
-        except OSError as e:
-            print(f"⚠️  CUDA provider DLL failed: {e}")
-            return False
+            # Only detection (SCRFD-10G) + recognition (ArcFace R100) are used;
+            # skipping landmark_2d/3d + genderage saves 3 model loads.
+            app = FaceAnalysis(
+                name='buffalo_l',
+                providers=providers,
+                allowed_modules=['detection', 'recognition'],
+            )
+            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            active = app.models['detection'].session.get_providers()[0]
+            print(f"✅ InsightFace buffalo_l on {active} — SCRFD-10G + ArcFace R100")
+            _face_app = app
+    return _face_app
 
-    return True
 
-
-if _cuda_works():
-    _ctx_id    = 0
-    _providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    _device    = 'GPU — CUDA (RTX 4080 SUPER)'
-else:
-    _ctx_id    = -1
-    _providers = ['CPUExecutionProvider']
-    _device    = 'CPU'
-    print("⚠️  CUDA unavailable — running on CPU.")
-
-face_app = FaceAnalysis(name='buffalo_l', providers=_providers)
-face_app.prepare(ctx_id=_ctx_id, det_size=(640, 640))
-
-print(f"✅ InsightFace buffalo_l on {_device} — SCRFD-10G + ArcFace R100")
+def warmup_async():
+    """Start loading the face model in a background thread."""
+    threading.Thread(target=get_face_app, name='face-warmup', daemon=True).start()
