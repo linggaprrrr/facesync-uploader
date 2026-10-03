@@ -9,7 +9,7 @@ import threading
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
-from core.device_setup import face_app, API_BASE
+from core.device_setup import get_face_app, API_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def process_faces_in_image_optimized(
 
         # InsightFace expects BGR (same as OpenCV default)
         with _inference_lock:
-            faces = face_app.get(img)
+            faces = get_face_app().get(img)
 
         if not faces:
             logger.warning(f"⚠️ No faces detected: {Path(file_path).name}")
@@ -106,7 +106,7 @@ def process_faces_from_bytes(
             return []
 
         with _inference_lock:
-            faces = face_app.get(img)
+            faces = get_face_app().get(img)
 
         if not faces:
             logger.warning("⚠️ No faces detected in provided bytes")
