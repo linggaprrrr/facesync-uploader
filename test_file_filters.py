@@ -40,4 +40,24 @@ with tempfile.TemporaryDirectory() as d:
     # Bare name, no folder to check against: keep.
     assert not is_derived_file("IMG_5790_3600.JPG")
 
+
+# Half-written photos were uploaded: the kiosk showed the top of the shot and
+# a smear below. A JPEG/PNG only counts once its end marker is on disk.
+from file_filters import is_fully_written
+
+with tempfile.TemporaryDirectory() as d:
+    def write(name, data):
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(data)
+        return p
+
+    assert is_fully_written(write("a.JPG", b"\xff\xd8...\xff\xd9"))
+    assert not is_fully_written(write("b.jpg", b"\xff\xd8...partial"))
+    assert not is_fully_written(write("c.jpg", b"\xff\xd8" + b"\0" * 64))  # preallocated
+    assert not is_fully_written(write("d.jpg", b""))
+    assert is_fully_written(write("e.png", b"\x89PNG...IEND\xaeB`\x82"))
+    assert not is_fully_written(write("f.png", b"\x89PNG...IDAT"))
+    assert is_fully_written(write("g.webp", b"RIFF"))
+    assert not is_fully_written(os.path.join(d, "missing.jpg"))
 print("OK")

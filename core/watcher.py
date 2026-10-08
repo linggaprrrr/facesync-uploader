@@ -6,7 +6,7 @@ from watchdog.events import FileSystemEventHandler
 import os
 from datetime import datetime
 
-from file_filters import is_derived_file
+from file_filters import is_derived_file, is_fully_written
 
 class OptimizedFolderWatcher(FileSystemEventHandler):
     """High-performance folder watcher with duplicate prevention"""
@@ -212,23 +212,25 @@ class OptimizedFolderWatcher(FileSystemEventHandler):
             print(f"❌ THOROUGH: Error processing {os.path.basename(file_path)}: {e}")
 
     def _fast_file_check(self, file_path):
-        """Fast file validation - 1-2 seconds only"""
+        """Ready once the size holds for a second and the image is complete.
+
+        Was "1s passed and size > 0": the photobooth app writes big framed
+        JPEGs slower than that, so half a photo got uploaded and sold.
+        """
         try:
-            # Wait 1 second
-            time.sleep(1)
-            
-            if not os.path.exists(file_path):
-                return False
-                
-            size = os.path.getsize(file_path)
-            if size == 0:
-                # Wait a bit more for empty files
-                time.sleep(2)
+            last = -1
+            for _ in range(60):
+                time.sleep(1)
+                if not os.path.exists(file_path):
+                    return False
                 size = os.path.getsize(file_path)
-                
-            # File must have content
-            return size > 0
-            
+                if size > 0 and size == last and is_fully_written(file_path):
+                    return True
+                last = size
+            # ponytail: a JPEG with data after its end marker never passes the
+            # trailer check — after 60s of a stable size, take it as finished.
+            print(f"⚠️ No end marker after 60s, uploading anyway: {os.path.basename(file_path)}")
+            return last > 0 and os.path.getsize(file_path) == last
         except Exception:
             return False
 
