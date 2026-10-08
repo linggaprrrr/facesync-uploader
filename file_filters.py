@@ -55,3 +55,25 @@ def _original_exists(path: str, suffix: str) -> bool:
         os.path.exists(os.path.join(folder, original + e))
         for e in {ext, ext.lower(), ext.upper()}
     )
+
+
+# Byte trailers a finished file ends with. The photobooth app writes big framed
+# JPEGs slowly on the Windows boxes; ingesting mid-write uploaded the top of
+# the photo and a smeared / blank remainder.
+_TRAILERS = {'.jpg': b'\xff\xd9', '.jpeg': b'\xff\xd9', '.png': b'IEND\xaeB`\x82'}
+
+
+def is_fully_written(path: str) -> bool:
+    """True once a JPEG/PNG ends with its end marker. Other formats: True."""
+    trailer = _TRAILERS.get(os.path.splitext(path)[1].lower())
+    if not trailer:
+        return True
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() < len(trailer):
+                return False
+            f.seek(-len(trailer), os.SEEK_END)
+            return f.read() == trailer
+    except OSError:
+        return False  # Windows: still locked by the writer
