@@ -101,7 +101,7 @@ def get_face_app():
                 ctx_id, providers = -1, ['CPUExecutionProvider']
                 print("⚠️  CUDA unavailable — running on CPU.")
 
-            # Only detection (SCRFD-10G) + recognition (ArcFace R100) are used;
+            # Only detection (SCRFD-10G) + recognition (ArcFace R50) are used;
             # skipping landmark_2d/3d + genderage saves 3 model loads.
             app = FaceAnalysis(
                 name='buffalo_l',
@@ -110,7 +110,7 @@ def get_face_app():
             )
             app.prepare(ctx_id=ctx_id, det_size=(640, 640))
             active = app.models['detection'].session.get_providers()[0]
-            print(f"✅ InsightFace buffalo_l on {active} — SCRFD-10G + ArcFace R100")
+            print(f"✅ InsightFace buffalo_l on {active} — SCRFD-10G + ArcFace R50")
             _face_app = app
     return _face_app
 
