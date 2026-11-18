@@ -1,5 +1,10 @@
 import sys
 import os
+# ponytail: onnxruntime must load before PyQt5. PyQt5 ships an old msvcp140.dll;
+# if Qt loads it first, onnxruntime 1.20's DLL init fails on Windows (WinError 1114).
+# The PATH setup in core.device_setup must run first so CUDA DLLs are found.
+import core.device_setup  # noqa: F401
+import onnxruntime  # noqa: F401
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
